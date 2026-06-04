@@ -1,0 +1,4 @@
+ollama
+pymetasploit3
+requests
+pytest

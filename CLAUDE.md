@@ -35,20 +35,32 @@ db/schema.sql     SQLite schema
 db/agent.db       SQLite database (gitignored)
 
 ## Build status
-- [ ] db/schema.sql
-- [ ] config.py
-- [ ] prompts.py
-- [ ] tools/memory.py
-- [ ] tests/test_memory.py
-- [ ] orchestrator.py
-- [ ] main.py
-- [ ] tools/recon.py
-- [ ] tools/intel.py
-- [ ] tools/exploit.py
-- [ ] tools/sessions.py
+- [x] db/schema.sql
+- [x] config.py
+- [x] prompts.py
+- [x] tools/memory.py
+- [x] tests/test_memory.py (17 tests)
+- [x] orchestrator.py
+- [x] main.py
+- [x] tools/recon.py
+- [x] tests/test_loop.py (7 tests)
+- [ ] tools/intel.py (Phase 3)
+- [ ] tools/exploit.py (Phase 3)
+- [ ] tools/sessions.py (Phase 3)
 
 ## Current phase
-Phase 1: Core agentic loop. No live target required yet.
+Phase 1: Complete. Phase 2 is next.
+
+## Phase 1 completion notes
+- All 24 tests passing (17 memory, 7 loop)
+- e2e test against real Ollama confirmed: tool dispatch works, tool names resolve,
+  memory tools execute, nmap fires real scans
+- Bug fixed: Ollama Python library requires {"type": "function", "function": {...}}
+  wrapper on tool schemas -- flat schemas cause tool name to be empty string
+- Known prompt engineering issue: model doesn't reliably call complete() when stuck,
+  tends to alternate text response / tool call and burn iterations. To be addressed
+  in Phase 2 prompt tuning.
+- e2e test lives at tests/e2e_real_model.py (uses temp DB, 10 iter / 120s limits)
 
 ## Phases
 
