@@ -274,7 +274,7 @@ def run(target: str) -> dict:
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": f"Pentest {target}. Call complete() when done."},
+        {"role": "user",   "content": f"Begin the engagement against {target}. Start by calling scan_ports to discover open services, then follow the workflow in your instructions."},
     ]
 
     client = ollama.Client(host=config.OLLAMA_HOST)
