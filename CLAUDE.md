@@ -50,7 +50,7 @@ db/agent.db       SQLite database (gitignored)
 - [ ] tools/sessions.py (Phase 3)
 
 ## Current phase
-Phase 1: Complete. Phase 2: Complete. Phase 3 is next.
+Phase 1: Complete. Phase 2: Complete. Phase 3: Complete. Phase 4 is next (prompt engineering).
 
 ## Phase 1 completion notes
 - All 24 tests passing (17 memory, 7 loop)
@@ -62,6 +62,32 @@ Phase 1: Complete. Phase 2: Complete. Phase 3 is next.
   tends to alternate text response / tool call and burn iterations. To be addressed
   in Phase 2 prompt tuning.
 - e2e test lives at tests/e2e_real_model.py (uses temp DB, 10 iter / 120s limits)
+
+## Phase 3 completion notes
+- 42 tests passing (added 13 intel tests)
+- tools/intel.py: lookup_cves (NVD API) and searchsploit (CLI) both wired in
+- tools/exploit.py: real pymetasploit3 connection, payload auto-selection from
+  preference list (cmd/unix/bind_netcat first), polls 20s for session
+- tools/sessions.py: list_sessions, run_command (sentinel echo pattern),
+  close_session
+- All tools wired into orchestrator TOOL_SCHEMAS and TOOL_MAP
+- config.py: MSF_SSL default changed true->false (msfrpcd -S disables SSL),
+  NVD_API_KEY added, AUTHORIZED_SCOPE made dynamic via env var
+- python-dotenv support added, .env created (gitignored)
+- Live runs conducted against Metasploitable 2 (192.168.56.101)
+- Bugs found and fixed during live runs:
+  - model forgot target IP -> anchored TARGET in system prompt (repeated 3x)
+  - scope error gave no hint -> error now includes authorized scope list
+  - memory_write passed strings/lists -> tool description now has per-category
+    dict examples
+  - run_module options passed as string -> coerce non-dict options to {}
+  - run_module port passed as string -> coerce to int
+  - kickoff message "call complete() when done" triggered immediate exit ->
+    replaced with explicit "start by calling scan_ports" instruction
+- Remaining model behavior issues deferred to Phase 4:
+  - model re-scans repeatedly when stuck instead of calling complete()
+  - memory_write still passes Python dict literal as string (not valid JSON)
+  - model does not progress through all services after one exploit fails
 
 ## Phase 2 completion notes
 - All 29 tests passing (17 memory, 7 loop, 5 enforcement)
@@ -105,7 +131,7 @@ Goal: prove the agent reads and writes memory reliably
 - tests/test_memory_enforcement.py
 - Prompt engineering iteration for memory discipline
 
-### Phase 3: CVE and exploit lookup (current)
+### Phase 3: CVE and exploit lookup (complete)
 Goal: agent can reason about vulnerabilities before acting
 - tools/intel.py (NVD API + SearchSploit)
 - tests/test_intel.py
@@ -117,7 +143,7 @@ Goal: agent can reason about vulnerabilities before acting
 - tools/sessions.py
 - First live run against Metasploitable
 
-### Phase 4: Hardening and tuning (blocked on Phase 3)
+### Phase 4: Hardening and tuning (current)
 Goal: reliable autonomous operation
 - Prompt engineering for consistent behavior
 - Stuck detection
