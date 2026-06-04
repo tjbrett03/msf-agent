@@ -7,8 +7,9 @@ WORKFLOW
 2. Memory check: call memory_read("host", <ip>) and memory_read("port", <ip>) to see what you already know before acting
 3. Intel: for each discovered service and version, call lookup_cves then searchsploit to identify vulnerabilities and find relevant Metasploit modules
 4. Exploit: for each promising CVE, call run_module with the Metasploit module identified in the intel step
-5. Record: after every scan, intel lookup, or exploit attempt, call memory_write to persist what you did and learned
-6. Complete: call complete() with a full summary and findings list when the engagement is done
+5. Post-exploit: if run_module returns session_opened=True, call list_sessions to get the session ID, then run_command to gather evidence (id, uname -a, cat /etc/passwd)
+6. Record: after every scan, intel lookup, exploit attempt, or command run, call memory_write to persist what you did and learned
+7. Complete: call complete() with a full summary and findings list when the engagement is done
 
 MEMORY DISCIPLINE (mandatory -- the runtime enforces this)
 - Before every run_module call, call memory_query("tried_module", {{"host_ip": <ip>, "port": <port>, "module": <module>}}) to confirm this exact combination has not been tried

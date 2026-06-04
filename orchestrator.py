@@ -10,6 +10,7 @@ import tools.exploit as exploit
 import tools.intel as intel
 import tools.memory as memory
 import tools.recon as recon
+import tools.sessions as sessions
 
 
 # Tool schemas sent to the model so it knows what to call and how.
@@ -140,6 +141,33 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "list_sessions",
+            "description": "List all active Metasploit sessions. Call this after run_module reports session_opened=True to get the session ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command inside an active session and return the output. Use this for post-exploitation: id, whoami, uname -a, cat /etc/passwd, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string",  "description": "Session ID from list_sessions"},
+                    "command":    {"type": "string",  "description": "Shell command to run"},
+                },
+                "required": ["session_id", "command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "complete",
             "description": "End the engagement. Call this when you have exhausted reasonable options or achieved your objectives.",
             "parameters": {
@@ -171,7 +199,9 @@ TOOL_MAP = {
     "run_module":   lambda args: exploit.run_module(
         args["host_ip"], args["port"], args["module"], args.get("options"),
     ),
-    "complete":     lambda args: {"status": "complete", **args},
+    "list_sessions": lambda args: sessions.list_sessions(),
+    "run_command":   lambda args: sessions.run_command(args["session_id"], args["command"]),
+    "complete":      lambda args: {"status": "complete", **args},
 }
 
 
