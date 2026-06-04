@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp.close()
@@ -24,6 +25,10 @@ import tools.memory as memory
 TARGET = config.AUTHORIZED_SCOPE[0]
 PORT   = 21
 
+# Canned return value for the real exploit.run_module so tests never need
+# a live msfrpcd connection.
+_MOCK_OK = {"status": "ok", "session_opened": False, "result": "stub"}
+
 
 def _unique(label: str) -> str:
     return f"exploit/unix/ftp/vsftpd_234_backdoor_{label}"
@@ -31,7 +36,8 @@ def _unique(label: str) -> str:
 
 class TestTriedModuleGuard(unittest.TestCase):
 
-    def test_first_run_allowed(self):
+    @patch("tools.exploit.run_module", return_value=_MOCK_OK)
+    def test_first_run_allowed(self, _mock):
         """run_module succeeds when no tried_module entry exists for this combination."""
         result = orchestrator._dispatch("run_module", {
             "host_ip": TARGET,
@@ -40,7 +46,8 @@ class TestTriedModuleGuard(unittest.TestCase):
         })
         self.assertEqual(result["status"], "ok")
 
-    def test_duplicate_run_blocked(self):
+    @patch("tools.exploit.run_module", return_value=_MOCK_OK)
+    def test_duplicate_run_blocked(self, _mock):
         """run_module returns an error when the same host/port/module has been tried."""
         module = _unique("duplicate")
 
@@ -55,7 +62,8 @@ class TestTriedModuleGuard(unittest.TestCase):
         self.assertEqual(second["status"], "error")
         self.assertIn("already tried", second["error"])
 
-    def test_auto_writes_tried_module(self):
+    @patch("tools.exploit.run_module", return_value=_MOCK_OK)
+    def test_auto_writes_tried_module(self, _mock):
         """orchestrator persists tried_module after run_module executes."""
         module = _unique("auto_write")
 
@@ -70,7 +78,8 @@ class TestTriedModuleGuard(unittest.TestCase):
         self.assertEqual(len(check["rows"]), 1)
         self.assertEqual(check["rows"][0]["module"], module)
 
-    def test_different_port_allowed(self):
+    @patch("tools.exploit.run_module", return_value=_MOCK_OK)
+    def test_different_port_allowed(self, _mock):
         """Same module on a different port is not blocked by the guard."""
         module = _unique("diff_port")
 

@@ -6,6 +6,7 @@ import ollama
 
 import config
 import prompts
+import tools.exploit as exploit
 import tools.intel as intel
 import tools.memory as memory
 import tools.recon as recon
@@ -167,14 +168,9 @@ TOOL_MAP = {
     "memory_read":  lambda args: memory.read(args["category"], args["key"]),
     "memory_write": lambda args: memory.write(args["category"], args["data"]),
     "memory_query": lambda args: memory.query(args["category"], args.get("filters")),
-    # Stub: real Metasploit connection wired in Phase 3.
-    "run_module":   lambda args: {
-        "status":  "ok",
-        "host_ip": args.get("host_ip"),
-        "port":    args.get("port"),
-        "module":  args.get("module"),
-        "result":  "stub: no Metasploit connection until Phase 3",
-    },
+    "run_module":   lambda args: exploit.run_module(
+        args["host_ip"], args["port"], args["module"], args.get("options"),
+    ),
     "complete":     lambda args: {"status": "complete", **args},
 }
 

@@ -14,7 +14,7 @@ MSF_HOST = os.getenv("MSF_HOST", "127.0.0.1")
 MSF_PORT = int(os.getenv("MSF_PORT", "55553"))
 MSF_USER = os.getenv("MSF_USER", "msf")
 MSF_PASS = os.getenv("MSF_PASS", "msf")
-MSF_SSL  = os.getenv("MSF_SSL", "true").lower() == "true"
+MSF_SSL  = os.getenv("MSF_SSL", "false").lower() == "true"
 
 # SQLite
 DB_PATH = os.path.expanduser(os.getenv("DB_PATH", "~/msf-agent/db/agent.db"))
