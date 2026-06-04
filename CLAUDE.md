@@ -44,12 +44,13 @@ db/agent.db       SQLite database (gitignored)
 - [x] main.py
 - [x] tools/recon.py
 - [x] tests/test_loop.py (7 tests)
+- [x] tests/test_memory_enforcement.py (5 tests)
 - [ ] tools/intel.py (Phase 3)
 - [ ] tools/exploit.py (Phase 3)
 - [ ] tools/sessions.py (Phase 3)
 
 ## Current phase
-Phase 1: Complete. Phase 2 is next.
+Phase 1: Complete. Phase 2: Complete. Phase 3 is next.
 
 ## Phase 1 completion notes
 - All 24 tests passing (17 memory, 7 loop)
@@ -62,6 +63,17 @@ Phase 1: Complete. Phase 2 is next.
   in Phase 2 prompt tuning.
 - e2e test lives at tests/e2e_real_model.py (uses temp DB, 10 iter / 120s limits)
 
+## Phase 2 completion notes
+- All 29 tests passing (17 memory, 7 loop, 5 enforcement)
+- Runtime tried_module guard in _dispatch blocks duplicate run_module calls at the
+  orchestrator level, independent of model behavior
+- Orchestrator auto-writes tried_module after each run_module so the guard holds
+  even if the model forgets to call memory_write
+- run_module added as stub (real Metasploit connection wired in Phase 3)
+- System prompt stripped of non-existent tool references, memory discipline rules
+  tightened and reordered to match actual workflow
+- host write fixed: ON CONFLICT DO NOTHING changed to update hostname/os_guess
+
 ## Phases
 
 ### Phase 0: Environment (complete)
@@ -73,7 +85,7 @@ Phase 1: Complete. Phase 2 is next.
 - Dependencies installed: pymetasploit3, ollama, requests
 - Tool calling confirmed working
 
-### Phase 1: Core agentic loop (current)
+### Phase 1: Core agentic loop (complete)
 Goal: prove the loop works before adding complexity
 - db/schema.sql
 - config.py
@@ -86,14 +98,14 @@ Goal: prove the loop works before adding complexity
 - tests/test_loop.py (loop test with mocked tools)
 Do not add Metasploit, CVE lookup, or real targets in this phase.
 
-### Phase 2: SQLite memory (blocked on Phase 1)
+### Phase 2: SQLite memory (complete)
 Goal: prove the agent reads and writes memory reliably
 - Runtime enforcement of tried_module check
 - Memory read-before-act pattern verified in practice
 - tests/test_memory_enforcement.py
 - Prompt engineering iteration for memory discipline
 
-### Phase 3: CVE and exploit lookup (blocked on Phase 2)
+### Phase 3: CVE and exploit lookup (current)
 Goal: agent can reason about vulnerabilities before acting
 - tools/intel.py (NVD API + SearchSploit)
 - tests/test_intel.py
