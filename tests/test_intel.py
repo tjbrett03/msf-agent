@@ -7,8 +7,15 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+
+# Must be set before any project import so config.DB_PATH is evaluated against
+# the temp file, not the real database.
+_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_tmp.close()
+os.environ["DB_PATH"] = _tmp.name
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

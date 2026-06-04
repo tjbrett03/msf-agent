@@ -6,6 +6,7 @@ import ollama
 
 import config
 import prompts
+import tools.intel as intel
 import tools.memory as memory
 import tools.recon as recon
 
@@ -26,6 +27,35 @@ TOOL_SCHEMAS = [
                     "arguments": {"type": "string", "description": "Extra nmap flags, e.g. '-sV -O'"},
                 },
                 "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_cves",
+            "description": "Query the NVD for CVEs matching a service name and version. Returns CVE IDs, descriptions, and CVSS scores sorted highest first. Call this after scan_ports to research each discovered service before attempting exploits.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string",  "description": "Service name, e.g. 'vsftpd', 'openssh', 'apache'"},
+                    "version": {"type": "string",  "description": "Version string, e.g. '2.3.4', '7.4p1'"},
+                },
+                "required": ["service", "version"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "searchsploit",
+            "description": "Search the Exploit-DB for public exploits matching a query. Use to find Metasploit module names for a known CVE or service/version.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search terms, e.g. 'vsftpd 2.3.4' or 'CVE-2011-2523'"},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -132,6 +162,8 @@ TOOL_SCHEMAS = [
 
 TOOL_MAP = {
     "scan_ports":   lambda args: recon.scan_ports(**args),
+    "lookup_cves":  lambda args: intel.lookup_cves(args["service"], args["version"]),
+    "searchsploit": lambda args: intel.searchsploit(args["query"]),
     "memory_read":  lambda args: memory.read(args["category"], args["key"]),
     "memory_write": lambda args: memory.write(args["category"], args["data"]),
     "memory_query": lambda args: memory.query(args["category"], args.get("filters")),
