@@ -83,7 +83,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "memory_write",
-            "description": "Persist a record to the agent's operational memory.",
+            "description": "Persist a record to the agent's operational memory. data must be a single dict, not a string or list. Examples by category -- host: {\"ip\": \"1.2.3.4\", \"hostname\": \"target\", \"os_guess\": \"Linux\"} -- port: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"protocol\": \"tcp\", \"state\": \"open\", \"service\": \"ftp\", \"version\": \"vsftpd 2.3.4\"} -- tried_module: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"module\": \"exploit/unix/ftp/vsftpd_234_backdoor\", \"result\": \"ok\", \"detail\": \"session opened\"} -- finding: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"title\": \"vsftpd backdoor\", \"severity\": \"critical\", \"evidence\": \"root shell obtained\"}",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -93,7 +93,7 @@ TOOL_SCHEMAS = [
                     },
                     "data": {
                         "type": "object",
-                        "description": "Field values matching the table schema for the given category",
+                        "description": "A single dict of field values for the chosen category. Must be a dict, not a string or list.",
                     },
                 },
                 "required": ["category", "data"],
@@ -217,7 +217,7 @@ def _dispatch(tool_name: str, tool_args: dict) -> dict:
     if tool_name == "scan_ports":
         target = tool_args.get("target", "")
         if target not in config.AUTHORIZED_SCOPE:
-            return {"status": "error", "error": f"{target} is not in authorized scope"}
+            return {"status": "error", "error": f"{target} is not in authorized scope -- authorized targets: {config.AUTHORIZED_SCOPE}"}
 
     if tool_name == "run_module":
         host_ip = tool_args.get("host_ip", "")
@@ -225,7 +225,7 @@ def _dispatch(tool_name: str, tool_args: dict) -> dict:
         module  = tool_args.get("module", "")
 
         if host_ip not in config.AUTHORIZED_SCOPE:
-            return {"status": "error", "error": f"{host_ip} is not in authorized scope"}
+            return {"status": "error", "error": f"{host_ip} is not in authorized scope -- authorized targets: {config.AUTHORIZED_SCOPE}"}
 
         # Runtime guard: block the module even if the model ignores its memory check.
         check = memory.query("tried_module", {"host_ip": host_ip, "port": port, "module": module})
@@ -270,7 +270,7 @@ def run(target: str) -> dict:
         return {"status": "error", "error": f"{target} is not in authorized scope"}
 
     tool_desc = prompts.build_tool_descriptions(TOOL_SCHEMAS)
-    system_prompt = prompts.build_system_prompt(tool_desc)
+    system_prompt = prompts.build_system_prompt(tool_desc, target)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -311,7 +311,7 @@ def run(target: str) -> dict:
             # Nudge the model back onto tool use rather than letting it drift.
             messages.append({
                 "role":    "user",
-                "content": "Please call a tool to continue the engagement.",
+                "content": f"Please call a tool to continue the engagement against {target}.",
             })
             continue
 
