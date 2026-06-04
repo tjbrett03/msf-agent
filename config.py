@@ -5,9 +5,11 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-# Target scope. Every network-touching tool validates against this list.
+# Target scope. Comma-separated IPs in env var, e.g. AUTHORIZED_SCOPE=192.168.56.101
 AUTHORIZED_SCOPE = [
-    "192.168.56.101",  # Metasploitable 2 (VirtualBox host-only)
+    ip.strip()
+    for ip in os.getenv("AUTHORIZED_SCOPE", "192.168.56.101").split(",")
+    if ip.strip()
 ]
 
 # Ollama
