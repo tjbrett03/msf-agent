@@ -1,4 +1,9 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 # Target scope. Every network-touching tool validates against this list.
 AUTHORIZED_SCOPE = [
