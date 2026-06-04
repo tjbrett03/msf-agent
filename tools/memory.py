@@ -88,7 +88,9 @@ def write(category: str, data: dict) -> dict:
                 """
                 INSERT INTO host (ip, hostname, os_guess)
                 VALUES (:ip, :hostname, :os_guess)
-                ON CONFLICT(ip) DO NOTHING
+                ON CONFLICT(ip) DO UPDATE SET
+                    hostname = excluded.hostname,
+                    os_guess = excluded.os_guess
                 """,
                 {
                     "ip":       data.get("ip"),

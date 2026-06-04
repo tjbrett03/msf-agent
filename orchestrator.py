@@ -92,6 +92,23 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "run_module",
+            "description": "Run a Metasploit exploit or auxiliary module against a target. Always call memory_query('tried_module') first to confirm the module has not already been tried on this host and port.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host_ip": {"type": "string",  "description": "Target IP address"},
+                    "port":    {"type": "integer", "description": "Target port number"},
+                    "module":  {"type": "string",  "description": "Metasploit module path, e.g. exploit/unix/ftp/vsftpd_234_backdoor"},
+                    "options": {"type": "object",  "description": "Optional module option overrides"},
+                },
+                "required": ["host_ip", "port", "module"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "complete",
             "description": "End the engagement. Call this when you have exhausted reasonable options or achieved your objectives.",
             "parameters": {
@@ -118,6 +135,14 @@ TOOL_MAP = {
     "memory_read":  lambda args: memory.read(args["category"], args["key"]),
     "memory_write": lambda args: memory.write(args["category"], args["data"]),
     "memory_query": lambda args: memory.query(args["category"], args.get("filters")),
+    # Stub: real Metasploit connection wired in Phase 3.
+    "run_module":   lambda args: {
+        "status":  "ok",
+        "host_ip": args.get("host_ip"),
+        "port":    args.get("port"),
+        "module":  args.get("module"),
+        "result":  "stub: no Metasploit connection until Phase 3",
+    },
     "complete":     lambda args: {"status": "complete", **args},
 }
 
@@ -135,6 +160,39 @@ def _dispatch(tool_name: str, tool_args: dict) -> dict:
         target = tool_args.get("target", "")
         if target not in config.AUTHORIZED_SCOPE:
             return {"status": "error", "error": f"{target} is not in authorized scope"}
+
+    if tool_name == "run_module":
+        host_ip = tool_args.get("host_ip", "")
+        port    = tool_args.get("port")
+        module  = tool_args.get("module", "")
+
+        if host_ip not in config.AUTHORIZED_SCOPE:
+            return {"status": "error", "error": f"{host_ip} is not in authorized scope"}
+
+        # Runtime guard: block the module even if the model ignores its memory check.
+        check = memory.query("tried_module", {"host_ip": host_ip, "port": port, "module": module})
+        if check.get("rows"):
+            return {
+                "status": "error",
+                "error":  f"{module} already tried on {host_ip}:{port} -- see tried_module for result",
+            }
+
+        try:
+            result = TOOL_MAP["run_module"](tool_args)
+        except TypeError as e:
+            return {"status": "error", "error": f"bad arguments for run_module: {e}"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+        # Persist the attempt so the guard holds on future calls, even if the model forgets.
+        memory.write("tried_module", {
+            "host_ip": host_ip,
+            "port":    port,
+            "module":  module,
+            "result":  result.get("status", "unknown"),
+            "detail":  json.dumps(result),
+        })
+        return result
 
     try:
         return TOOL_MAP[tool_name](tool_args)
