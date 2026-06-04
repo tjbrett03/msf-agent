@@ -19,6 +19,9 @@ MSF_SSL  = os.getenv("MSF_SSL", "true").lower() == "true"
 # SQLite
 DB_PATH = os.path.expanduser(os.getenv("DB_PATH", "~/msf-agent/db/agent.db"))
 
+# NVD API (optional -- raises rate limit from 5 to 50 req/30s)
+NVD_API_KEY = os.getenv("NVD_API_KEY", "")
+
 # Agentic loop hard limits
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "50"))
 MAX_DURATION   = int(os.getenv("MAX_DURATION", "3600"))  # seconds
