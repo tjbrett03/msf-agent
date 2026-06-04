@@ -132,7 +132,25 @@ Goal: agent has domain expertise beyond CVE data
 - Exploitation playbooks authored and ingested
 - knowledge_search() tool wired in
 
-### Phase 6: Documentation and packaging (blocked on Phase 5)
+### Phase 6: Web interface (blocked on Phase 5)
+Goal: real-time browser UI for demo and portfolio
+- FastAPI backend with WebSocket support
+- Orchestrator runs in background thread, streams events to WebSocket
+- Browser receives live feed of: tool calls, tool results, iteration count,
+  elapsed time, findings as they are discovered
+- Single page UI showing:
+    - Target IP input and Start/Stop controls
+    - Live event log (tool name, arguments, result, timestamp)
+    - Findings table (host, port, title, severity, evidence)
+    - Memory panel (what the agent currently knows about the target)
+    - Iteration counter and elapsed time
+- Clean, minimal design, dark theme, no external CSS frameworks
+- FastAPI serves the HTML on GET /, WebSocket on /ws
+- Agent output goes to WebSocket, not just stdout
+- Stop button triggers clean shutdown, not a hard kill
+- All existing tool and orchestrator logic stays untouched
+
+### Phase 7: Documentation and packaging (blocked on Phase 6)
 Goal: portfolio-ready project
 - README with architecture explanation
 - Architecture diagram
