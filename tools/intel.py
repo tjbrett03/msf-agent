@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 
 import requests
@@ -6,6 +7,48 @@ import requests
 import config
 
 _NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+# Words that appear first in nmap version strings but are not the actual software
+# name -- skip them when extracting the software name for NVD lookup.
+_VENDOR_PREFIXES = {"isc", "gnu", "linux", "netkit", "mit", "openssl"}
+
+
+def _normalize_lookup(service: str, version: str) -> tuple[str, str]:
+    """
+    Normalize nmap service/version strings for better NVD keyword search results.
+
+    nmap version strings often look like:
+      "vsftpd 2.3.4"                              -> ("vsftpd", "2.3.4")
+      "OpenSSH 4.7p1 Debian 8ubuntu1 protocol 2"  -> ("openssh", "4.7p1")
+      "Apache httpd 2.2.8 (Ubuntu) DAV/2"         -> ("apache", "2.2.8")
+      "ISC BIND 9.4.2"                            -> ("bind", "9.4.2")
+      "Linux telnetd"                             -> ("telnetd", "")
+
+    Returns (normalized_service, version_token) suitable for NVD keyword search.
+    """
+    if not version:
+        return service, version
+
+    words = version.split()
+
+    # Extract software name: first word not in the vendor-prefix list.
+    software = service
+    for word in words:
+        candidate = word.lower().rstrip("-/:()")
+        if candidate and re.match(r"^[a-z]", candidate) and candidate not in _VENDOR_PREFIXES:
+            software = candidate
+            break
+
+    # Extract the first version token: starts with a digit, followed by digits,
+    # dots, or a single lowercase letter+digit patch suffix (e.g. "4.7p1").
+    version_token = ""
+    for word in words:
+        m = re.match(r"^(\d+(?:[.\-]\d+)*(?:[a-z]\d+)?)", word)
+        if m:
+            version_token = m.group(1).rstrip(".")
+            break
+
+    return software, version_token
 
 
 def _extract_cve(vuln: dict) -> dict:
@@ -41,15 +84,20 @@ def lookup_cves(service: str, version: str) -> dict:
     """
     Query NVD for CVEs matching service and version.
     Returns up to 10 results sorted by CVSS score descending.
+    Normalizes nmap version strings before searching (e.g. "vsftpd 2.3.4" ->
+    searches "vsftpd 2.3.4" rather than "ftp vsftpd 2.3.4").
     """
     try:
+        normalized_service, normalized_version = _normalize_lookup(service, version)
+        keyword = f"{normalized_service} {normalized_version}".strip()
+
         headers = {}
         if config.NVD_API_KEY:
             headers["apiKey"] = config.NVD_API_KEY
 
         resp = requests.get(
             _NVD_BASE,
-            params={"keywordSearch": f"{service} {version}", "resultsPerPage": 10},
+            params={"keywordSearch": keyword, "resultsPerPage": 10},
             headers=headers,
             timeout=15,
         )
@@ -60,8 +108,8 @@ def lookup_cves(service: str, version: str) -> dict:
 
         return {
             "status":  "ok",
-            "service": service,
-            "version": version,
+            "service": normalized_service,
+            "version": normalized_version,
             "count":   len(cves),
             "cves":    cves,
         }

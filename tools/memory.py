@@ -11,6 +11,10 @@ def _connect() -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    # WAL mode allows concurrent readers while a writer holds the lock,
+    # eliminating "database is locked" errors when multiple tool calls run
+    # back-to-back in the same iteration.
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -28,61 +32,59 @@ def get_connection() -> sqlite3.Connection:
 
 # --- tool functions ---
 
-def read(category: str, key: str) -> dict:
+def read(category: str, key: str, filters: dict | None = None) -> dict:
     """
-    Read all rows in a category matching the given key.
+    Read all rows in a category matching the given key (usually an IP address).
+    Optional filters dict adds extra AND conditions on top of the key lookup.
 
     category: "host", "port", "tried_module", "credential", "finding", "session"
     key: typically an IP address
+    filters: optional dict of column=value pairs to narrow results
     """
+    conn = get_connection()
     try:
-        conn = get_connection()
-        rows = []
+        table_key_map = {
+            "host":         ("host",         "ip"),
+            "port":         ("port",         "host_ip"),
+            "tried_module": ("tried_module", "host_ip"),
+            "credential":   ("credential",   "host_ip"),
+            "finding":      ("finding",      "host_ip"),
+            "session":      ("session",      "host_ip"),
+        }
 
-        if category == "host":
-            cur = conn.execute("SELECT * FROM host WHERE ip = ?", (key,))
-            rows = [dict(r) for r in cur.fetchall()]
-
-        elif category == "port":
-            cur = conn.execute("SELECT * FROM port WHERE host_ip = ?", (key,))
-            rows = [dict(r) for r in cur.fetchall()]
-
-        elif category == "tried_module":
-            cur = conn.execute("SELECT * FROM tried_module WHERE host_ip = ?", (key,))
-            rows = [dict(r) for r in cur.fetchall()]
-
-        elif category == "credential":
-            cur = conn.execute("SELECT * FROM credential WHERE host_ip = ?", (key,))
-            rows = [dict(r) for r in cur.fetchall()]
-
-        elif category == "finding":
-            cur = conn.execute("SELECT * FROM finding WHERE host_ip = ?", (key,))
-            rows = [dict(r) for r in cur.fetchall()]
-
-        elif category == "session":
-            cur = conn.execute("SELECT * FROM session WHERE host_ip = ?", (key,))
-            rows = [dict(r) for r in cur.fetchall()]
-
-        else:
+        if category not in table_key_map:
             return {"status": "error", "error": f"unknown category: {category}"}
 
-        conn.close()
+        table, key_col = table_key_map[category]
+        extra = filters or {}
+
+        conditions = [f"{key_col} = ?"]
+        values: list = [key]
+        for col, val in extra.items():
+            conditions.append(f"{col} = ?")
+            values.append(val)
+
+        sql = f"SELECT * FROM {table} WHERE {' AND '.join(conditions)}"
+        cur = conn.execute(sql, values)
+        rows = [dict(r) for r in cur.fetchall()]
         return {"status": "ok", "category": category, "key": key, "rows": rows}
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
 
 
-def write(category: str, data: dict) -> dict:
+def write(category: str, data: dict | list) -> dict:
     """
     Insert or update a record.
 
     category: "host", "port", "tried_module", "credential", "finding", "session"
-    data: dict of field values matching the table schema
+    data: dict of field values matching the table schema. For "port" category,
+          data may also be a list of dicts to bulk-insert all ports in one call.
     """
+    conn = get_connection()
     try:
-        conn = get_connection()
-
         if category == "host":
             conn.execute(
                 """
@@ -100,24 +102,26 @@ def write(category: str, data: dict) -> dict:
             )
 
         elif category == "port":
-            conn.execute(
-                """
-                INSERT INTO port (host_ip, port, protocol, state, service, version)
-                VALUES (:host_ip, :port, :protocol, :state, :service, :version)
-                ON CONFLICT(host_ip, port, protocol) DO UPDATE SET
-                    state   = excluded.state,
-                    service = excluded.service,
-                    version = excluded.version
-                """,
-                {
-                    "host_ip":  data.get("host_ip"),
-                    "port":     data.get("port"),
-                    "protocol": data.get("protocol", "tcp"),
-                    "state":    data.get("state", "open"),
-                    "service":  data.get("service"),
-                    "version":  data.get("version"),
-                },
-            )
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                conn.execute(
+                    """
+                    INSERT INTO port (host_ip, port, protocol, state, service, version)
+                    VALUES (:host_ip, :port, :protocol, :state, :service, :version)
+                    ON CONFLICT(host_ip, port, protocol) DO UPDATE SET
+                        state   = excluded.state,
+                        service = excluded.service,
+                        version = excluded.version
+                    """,
+                    {
+                        "host_ip":  item.get("host_ip"),
+                        "port":     item.get("port"),
+                        "protocol": item.get("protocol", "tcp"),
+                        "state":    item.get("state", "open"),
+                        "service":  item.get("service"),
+                        "version":  item.get("version"),
+                    },
+                )
 
         elif category == "tried_module":
             conn.execute(
@@ -190,11 +194,12 @@ def write(category: str, data: dict) -> dict:
             return {"status": "error", "error": f"unknown category: {category}"}
 
         conn.commit()
-        conn.close()
         return {"status": "ok", "category": category, "written": True}
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
 
 
 def query(category: str, filters: dict | None = None) -> dict:
@@ -204,9 +209,8 @@ def query(category: str, filters: dict | None = None) -> dict:
     Primarily used by the agent to check tried_module before attempting an exploit.
     filters: dict of column=value pairs to filter by (all ANDed together)
     """
+    conn = get_connection()
     try:
-        conn = get_connection()
-
         table_map = {
             "host":         "host",
             "port":         "port",
@@ -231,8 +235,9 @@ def query(category: str, filters: dict | None = None) -> dict:
             cur = conn.execute(f"SELECT * FROM {table}")
 
         rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
         return {"status": "ok", "category": category, "filters": filters, "rows": rows}
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
