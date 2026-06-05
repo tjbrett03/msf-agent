@@ -65,7 +65,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "memory_read",
-            "description": "Read all records in a category for a given key (usually an IP address).",
+            "description": "Read records from the agent's operational memory. Pass key (an IP address) to fetch all records for that host. Pass filters to narrow results by any column. Use this to check tried_module before attempting an exploit: memory_read('tried_module', '1.2.3.4', {'module': 'exploit/...'}).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -73,7 +73,14 @@ TOOL_SCHEMAS = [
                         "type": "string",
                         "description": "One of: host, port, tried_module, credential, finding, session",
                     },
-                    "key": {"type": "string", "description": "IP address to look up"},
+                    "key": {
+                        "type": "string",
+                        "description": "IP address to look up (required)",
+                    },
+                    "filters": {
+                        "type": "object",
+                        "description": "Optional dict of column=value pairs to narrow results, e.g. {\"module\": \"exploit/unix/ftp/vsftpd_234_backdoor\"}",
+                    },
                 },
                 "required": ["category", "key"],
             },
@@ -83,7 +90,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "memory_write",
-            "description": "Persist a record to the agent's operational memory. data must be a single dict, not a string or list. Examples by category -- host: {\"ip\": \"1.2.3.4\", \"hostname\": \"target\", \"os_guess\": \"Linux\"} -- port: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"protocol\": \"tcp\", \"state\": \"open\", \"service\": \"ftp\", \"version\": \"vsftpd 2.3.4\"} -- tried_module: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"module\": \"exploit/unix/ftp/vsftpd_234_backdoor\", \"result\": \"ok\", \"detail\": \"session opened\"} -- finding: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"title\": \"vsftpd backdoor\", \"severity\": \"critical\", \"evidence\": \"root shell obtained\"}",
+            "description": "Persist a record to the agent's operational memory. For the port category, data may be a list of port dicts to write all ports at once. Examples -- host: {\"ip\": \"1.2.3.4\", \"hostname\": \"target\", \"os_guess\": \"Linux\"} -- port (single): {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"protocol\": \"tcp\", \"state\": \"open\", \"service\": \"ftp\", \"version\": \"vsftpd 2.3.4\"} -- port (bulk): [{\"host_ip\": \"1.2.3.4\", \"port\": 21, ...}, {\"host_ip\": \"1.2.3.4\", \"port\": 22, ...}] -- tried_module: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"module\": \"exploit/unix/ftp/vsftpd_234_backdoor\", \"result\": \"ok\", \"detail\": \"session opened\"} -- finding: {\"host_ip\": \"1.2.3.4\", \"port\": 21, \"title\": \"vsftpd backdoor\", \"severity\": \"critical\", \"evidence\": \"root shell obtained\"}",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -93,31 +100,10 @@ TOOL_SCHEMAS = [
                     },
                     "data": {
                         "type": "object",
-                        "description": "A single dict of field values for the chosen category. Must be a dict, not a string or list.",
+                        "description": "A dict of field values for the chosen category, or a list of dicts for the port category bulk insert.",
                     },
                 },
                 "required": ["category", "data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "memory_query",
-            "description": "Query a category with optional column filters. Use this to check tried_module before attempting an exploit.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "One of: host, port, tried_module, credential, finding, session",
-                    },
-                    "filters": {
-                        "type": "object",
-                        "description": "Optional dict of column=value pairs to filter results",
-                    },
-                },
-                "required": ["category"],
             },
         },
     },
@@ -193,8 +179,10 @@ TOOL_MAP = {
     "scan_ports":   lambda args: recon.scan_ports(**args),
     "lookup_cves":  lambda args: intel.lookup_cves(args["service"], args["version"]),
     "searchsploit": lambda args: intel.searchsploit(args["query"]),
-    "memory_read":  lambda args: memory.read(args["category"], args["key"]),
+    "memory_read":  lambda args: memory.read(args["category"], args["key"], args.get("filters")),
     "memory_write": lambda args: memory.write(args["category"], args["data"]),
+    # memory_query kept as an internal alias so orchestrator code and existing tests
+    # that call it directly continue to work; the model only sees memory_read.
     "memory_query": lambda args: memory.query(args["category"], args.get("filters")),
     "run_module":   lambda args: exploit.run_module(
         args["host_ip"], args["port"], args["module"], args.get("options"),
@@ -223,6 +211,9 @@ def _dispatch(tool_name: str, tool_args: dict) -> dict:
         host_ip = tool_args.get("host_ip", "")
         port    = tool_args.get("port")
         module  = tool_args.get("module", "")
+
+        if not host_ip:
+            return {"status": "error", "error": "missing required field: host_ip"}
 
         if host_ip not in config.AUTHORIZED_SCOPE:
             return {"status": "error", "error": f"{host_ip} is not in authorized scope -- authorized targets: {config.AUTHORIZED_SCOPE}"}
@@ -261,6 +252,187 @@ def _dispatch(tool_name: str, tool_args: dict) -> dict:
         return {"status": "error", "error": str(e)}
 
 
+def _normalize_scan_key(tool_args: dict) -> tuple[str, str]:
+    """
+    Return (target, normalized_port_range) for duplicate-scan detection.
+    Strips the 'arguments' flag so scans differing only in nmap flags compare equal.
+    Rounds port range end down to the nearest 1000 so '1-1000' and '1-1024' compare equal.
+    """
+    target = tool_args.get("target", "")
+    ports  = str(tool_args.get("ports", ""))
+    if "-" in ports:
+        parts = ports.split("-", 1)
+        try:
+            end      = int(parts[1].strip())
+            end_norm = (end // 1000) * 1000
+            ports    = f"{parts[0].strip()}-{end_norm}"
+        except ValueError:
+            pass
+    return target, ports
+
+
+def _clear_sessions() -> None:
+    """Kill any MSF sessions left over from a previous engagement."""
+    result = sessions.list_sessions()
+    if result.get("status") != "ok":
+        return
+    count = result.get("count", 0)
+    if count > 0:
+        print(f"[setup] clearing {count} pre-existing session(s)")
+        for sid in result["sessions"]:
+            sessions.close_session(sid)
+
+
+def _clear_engagement_tables(target: str) -> None:
+    """
+    Delete all rows for target from every engagement table so each run starts
+    from a clean slate. Stale tried_module or port data from a prior run would
+    confuse the model into trying dead sessions or skipping already-tried services.
+    """
+    conn = memory.get_connection()
+    try:
+        for table in ("port", "tried_module", "credential", "finding", "session"):
+            conn.execute(f"DELETE FROM {table} WHERE host_ip = ?", (target,))
+        conn.execute("DELETE FROM host WHERE ip = ?", (target,))
+        conn.commit()
+        print(f"[setup] cleared engagement tables for {target}")
+    except Exception as e:
+        print(f"[setup] warning: could not clear tables: {e}")
+    finally:
+        conn.close()
+
+
+_MAX_TOOL_RESULT_CHARS = 1000
+
+
+def _truncate_result(result: dict) -> str:
+    """
+    Serialize result to JSON. If it exceeds the limit, truncate and append a
+    marker so the model knows data was cut. Prevents repeated large tool results
+    (port tables, CVE lists) from filling the context window across 50 iterations.
+    """
+    s = json.dumps(result)
+    if len(s) <= _MAX_TOOL_RESULT_CHARS:
+        return s
+    return s[:_MAX_TOOL_RESULT_CHARS] + f"... [truncated, {len(s)} chars total]"
+
+
+def _sudo_l_status(messages: list[dict]) -> str:
+    """
+    Scan the last 10 tool-role messages for evidence of a sudo -l result.
+    Returns 'full_sudo' if (ALL) ALL or (ALL : ALL) was found in output,
+    'partial' if sudo -l ran but no full-access entry was present,
+    or 'not_run' if sudo -l has not been called yet.
+    """
+    for m in reversed(messages[-10:]):
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content", "")
+        if '"command": "sudo -l"' not in content:
+            continue
+        if "(ALL) ALL" in content or "(ALL : ALL)" in content:
+            return "full_sudo"
+        return "partial"
+    return "not_run"
+
+
+def build_supervisor_directive(target: str, messages: list[dict]) -> str:
+    """
+    Inspect DB state and recent message history to produce a concise
+    steering directive injected before every Ollama call. Rules are
+    checked in strict priority order; the first match wins.
+    """
+    # Rule 1: a root shell is open -- nothing else matters.
+    session_result = memory.query("session", {"host_ip": target})
+    if session_result.get("status") == "ok":
+        open_sessions = [
+            r for r in session_result.get("rows", [])
+            if r.get("closed_at") is None
+        ]
+        for row in open_sessions:
+            is_root = (
+                row.get("username") == "root"
+                or "root" in (row.get("session_type") or "").lower()
+            )
+            if is_root:
+                msf_id = row.get("msf_id", "?")
+                return (
+                    f"STOP EXPLOITING. You have a root shell on {target} "
+                    f"(session {msf_id}). Run post-exploitation commands now: "
+                    "whoami, id, uname -a, cat /etc/passwd, cat /etc/shadow. "
+                    "Write findings then call complete()."
+                )
+
+    # Rule 2: a non-root shell is open -- escalate before trying new services.
+    # The specific directive depends on how far along the escalation attempt is.
+    if session_result.get("status") == "ok":
+        open_sessions = [
+            r for r in session_result.get("rows", [])
+            if r.get("closed_at") is None
+        ]
+        if open_sessions:
+            msf_id = open_sessions[0].get("msf_id", "?")
+            sudo_status = _sudo_l_status(messages)
+            if sudo_status == "full_sudo":
+                return (
+                    f"You already confirmed full sudo access on {target}. "
+                    f"Run 'sudo id' in session {msf_id} right now to confirm root. "
+                    "Then write a critical finding and call complete()."
+                )
+            if sudo_status == "partial":
+                return (
+                    f"sudo -l ran but no full sudo rights found on {target} "
+                    f"(session {msf_id}). "
+                    "Check SUID binaries: find / -perm -4000 2>/dev/null "
+                    "or check kernel version for local exploits."
+                )
+            return (
+                f"You have a user shell on {target} (session {msf_id}). "
+                "Attempt privilege escalation before trying new exploits. "
+                "Try sudo -l first."
+            )
+
+    # Rule 3: known ports exist but at least one has no exploit attempt yet.
+    ports_result  = memory.read("port", target)
+    tried_result  = memory.query("tried_module", {"host_ip": target})
+    if ports_result.get("status") == "ok" and ports_result.get("rows"):
+        all_ports   = {r["port"] for r in ports_result["rows"]}
+        tried_ports = {r["port"] for r in tried_result.get("rows", [])}
+        untried     = sorted(all_ports - tried_ports)
+        if untried:
+            return (
+                f"Untried services on {target}: ports {untried}. "
+                "Do not call complete() until each has an attempt or a documented skip reason."
+            )
+
+    # Rule 4: model has scanned the same target twice in the last 6 messages.
+    scan_count = 0
+    for m in messages[-6:]:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls", []):
+            fn = tc.get("function", {})
+            if fn.get("name") != "scan_ports":
+                continue
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if args.get("target") == target:
+                scan_count += 1
+    if scan_count >= 2:
+        return (
+            f"You have already scanned {target} twice. "
+            "Port data is in memory. Do not scan again. "
+            "Move to exploitation."
+        )
+
+    # Rule 5: no special condition.
+    return "Continue the engagement."
+
+
 def run(target: str) -> dict:
     """
     Run the agentic loop against target until complete() is called or limits hit.
@@ -268,6 +440,9 @@ def run(target: str) -> dict:
     """
     if target not in config.AUTHORIZED_SCOPE:
         return {"status": "error", "error": f"{target} is not in authorized scope"}
+
+    _clear_sessions()
+    _clear_engagement_tables(target)
 
     tool_desc = prompts.build_tool_descriptions(TOOL_SCHEMAS)
     system_prompt = prompts.build_system_prompt(tool_desc, target)
@@ -280,6 +455,8 @@ def run(target: str) -> dict:
     client = ollama.Client(host=config.OLLAMA_HOST)
     start_time = time.time()
     iteration = 0
+    last_scan_key: tuple | None = None   # normalized (target, port_range) of last scan
+    scan_counts: dict[str, int] = {}     # target -> number of scans performed this run
 
     while iteration < config.MAX_ITERATIONS:
         elapsed = time.time() - start_time
@@ -290,12 +467,13 @@ def run(target: str) -> dict:
             }
 
         iteration += 1
-        print(f"[iter {iteration}] calling model...")
+        directive = build_supervisor_directive(target, messages)
+        print(f"[iter {iteration}] directive: {directive}")
 
         try:
             response = client.chat(
                 model=config.OLLAMA_MODEL,
-                messages=messages,
+                messages=messages + [{"role": "user", "content": directive}],
                 tools=TOOL_SCHEMAS,
             )
         except Exception as e:
@@ -330,17 +508,75 @@ def run(target: str) -> dict:
                 except json.JSONDecodeError:
                     tool_args = {}
 
+            # Stuck detection for repeated scan_ports calls.
+            if tool_name == "scan_ports":
+                scan_target = tool_args.get("target", "")
+                prior_count = scan_counts.get(scan_target, 0)
+
+                if prior_count >= 2:
+                    # Hard block: target has been scanned twice already.
+                    block_msg = (
+                        f"You have already scanned {target} twice in this engagement. "
+                        "Do NOT scan again. Call memory_read('port', '"
+                        f"{target}') to access the stored port data and move to exploitation."
+                    )
+                    messages.append({"role": "user", "content": block_msg})
+                    result = {
+                        "status": "error",
+                        "error":  f"scan blocked: {scan_target} scanned {prior_count} times -- use memory_read to access port data",
+                    }
+                    print(f"[iter {iteration}] scan blocked ({prior_count} prior scans for {scan_target})")
+                    messages.append({"role": "tool", "content": _truncate_result(result)})
+                    continue
+
+                scan_key = _normalize_scan_key(tool_args)
+                if scan_key == last_scan_key:
+                    messages.append({
+                        "role":    "user",
+                        "content": (
+                            f"You already have port data for {target} from the previous scan. "
+                            "Do not scan again. Use the data you already have and move to the next step."
+                        ),
+                    })
+                last_scan_key = scan_key
+                scan_counts[scan_target] = prior_count + 1
+
             print(f"[iter {iteration}] tool call: {tool_name}({tool_args})")
             result = _dispatch(tool_name, tool_args)
             print(f"[iter {iteration}] tool result: {result}")
 
             messages.append({
                 "role":    "tool",
-                "content": json.dumps(result),
+                "content": _truncate_result(result),
             })
 
             if result.get("status") == "complete":
                 return result
+
+            # When a session opens, auto-detect root via 'id' and write to the
+            # session table so the supervisor directive steers via Rule 1
+            # (root shell) or Rule 2 (user shell) on the next iteration.
+            if tool_name == "run_module" and result.get("session_opened"):
+                sid = str(result.get("session_id", ""))
+                # Give the shell time to stabilize; probing immediately returns empty output.
+                time.sleep(2)
+                id_result = sessions.run_command(sid, "id")
+                if "uid=0" in id_result.get("output", ""):
+                    username = "root"
+                else:
+                    whoami_result = sessions.run_command(sid, "whoami")
+                    if "root" in whoami_result.get("output", ""):
+                        username = "root"
+                    else:
+                        print(f"[session] warning: could not confirm username for sid={sid}")
+                        username = "unknown"
+                memory.write("session", {
+                    "msf_id":       sid,
+                    "host_ip":      target,
+                    "session_type": "shell",
+                    "username":     username,
+                })
+                print(f"[session] sid={sid} username={username}")
 
     return {
         "status":  "limit_reached",

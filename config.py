@@ -14,7 +14,7 @@ AUTHORIZED_SCOPE = [
 
 # Ollama
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 
 # Metasploit RPC
 MSF_HOST = os.getenv("MSF_HOST", "127.0.0.1")
