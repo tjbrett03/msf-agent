@@ -61,9 +61,23 @@ Phase 1: Complete. Phase 2: Complete. Phase 3: Complete. Phase 4 is current
 (hardening and tuning).
 
 ## Phase 4 progress (resume here)
-Still NONE of this is committed. Untracked: web files + run.py. Modified/unstaged:
-orchestrator.py, dashboard_routes.py, .gitignore, requirements.txt, CLAUDE.md.
-Leave staging/commit to the user. 93 tests pass.
+STATUS (end of 2026-06-13 session): all of this session's work is committed on
+branch `feature/engagement-suite` (4 commits) and pushed; PR #1 is open against
+master (NOT merged yet -- https://github.com/tjbrett03/msf-agent/pull/1). 101
+tests pass. master does not have any of it until the PR merges.
+
+IMMEDIATE LOOSE ENDS (small, do first next session):
+1. prompts.py still instructs the model to "write findings" -- the runtime now
+   blocks that (memory_write('finding') and complete(findings) are dropped), so
+   the model wastes a few iterations trying. Strip the stale finding-writing
+   lines from prompts.py. KEEP the stop-at-root flow: it still matches directive
+   Rule 1 and the full-suite rewrite (Phase B) will change it deliberately.
+2. run.py uses atexit to stop msfrpcd, but SIGTERM bypasses atexit, so `kill`/
+   programmatic restart orphans msfrpcd (Ctrl+C is fine). Add a SIGTERM handler
+   that sys.exit(0) so atexit runs. ~5 lines.
+
+THEN the big one: Phase A (memory/context hardening) -> Phase B (full-suite
+exploit-and-document-every-vuln). See backlog item B below.
 
 ### Session of 2026-06-12 (most recent, resume from NEXT below)
 - run.py: single launcher. Preflights Ollama/msfrpcd/target, auto-starts msfrpcd
