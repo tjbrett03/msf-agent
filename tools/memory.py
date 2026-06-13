@@ -18,7 +18,22 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns to tables that predate them, before schema.sql runs.
+
+    CREATE TABLE IF NOT EXISTS cannot alter an existing table, and schema.sql now
+    builds an index on finding.engagement_id, so on a pre-existing DB that column
+    must be added here first or the index creation fails. On a fresh DB the
+    finding table does not exist yet (PRAGMA returns nothing) and this is a no-op.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(finding)").fetchall()]
+    if cols and "engagement_id" not in cols:
+        conn.execute("ALTER TABLE finding ADD COLUMN engagement_id TEXT")
+        conn.commit()
+
+
 def _init_schema(conn: sqlite3.Connection) -> None:
+    _migrate(conn)
     schema_path = Path(__file__).parent.parent / "db" / "schema.sql"
     conn.executescript(schema_path.read_text())
     conn.commit()
@@ -161,8 +176,8 @@ def write(category: str, data: dict | list) -> dict:
         elif category == "finding":
             conn.execute(
                 """
-                INSERT INTO finding (host_ip, port, title, severity, evidence)
-                VALUES (:host_ip, :port, :title, :severity, :evidence)
+                INSERT INTO finding (host_ip, port, title, severity, evidence, engagement_id)
+                VALUES (:host_ip, :port, :title, :severity, :evidence, :engagement_id)
                 """,
                 {
                     "host_ip":  data.get("host_ip"),
@@ -170,6 +185,7 @@ def write(category: str, data: dict | list) -> dict:
                     "title":    data.get("title"),
                     "severity": data.get("severity"),
                     "evidence": data.get("evidence"),
+                    "engagement_id": data.get("engagement_id"),
                 },
             )
 
@@ -196,6 +212,56 @@ def write(category: str, data: dict | list) -> dict:
         conn.commit()
         return {"status": "ok", "category": category, "written": True}
 
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
+
+
+def create_engagement(engagement_id: str, target: str) -> dict:
+    """Record the start of a run. INSERT OR IGNORE so a re-entrant call is safe."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO engagement (id, target, status) VALUES (?, ?, 'running')",
+            (engagement_id, target),
+        )
+        conn.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
+
+
+def finish_engagement(engagement_id: str, status: str, summary: str | None = None) -> dict:
+    """Record the terminal state of a run (last writer wins). finish() is the
+    authoritative caller; an explicit End relies on abort -> finish for status."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE engagement SET status = ?, summary = ?, ended_at = datetime('now') WHERE id = ?",
+            (status, summary, engagement_id),
+        )
+        conn.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
+
+
+def write_event(engagement_id: str, etype: str, payload, ts: float) -> dict:
+    """Persist one telemetry event so a past engagement's feed/modules can be
+    replayed on reload. payload is serialized to JSON."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO event (engagement_id, type, payload, ts) VALUES (?, ?, ?, ?)",
+            (engagement_id, etype, json.dumps(payload), ts),
+        )
+        conn.commit()
+        return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
     finally:
