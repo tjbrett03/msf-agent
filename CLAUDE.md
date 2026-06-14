@@ -62,21 +62,82 @@ Phase 1: Complete. Phase 2: Complete. Phase 3: Complete. Phase 4 is current
 
 ## Phase 4 progress (resume here)
 STATUS (2026-06-14): PR #1 (feature/engagement-suite) is MERGED into master
-(merge commit 96bd8f0). master now contains all the engagement-suite work. 101
+(merge commit 96bd8f0). Work since then is committed directly on master. 110
 tests pass.
 
-IMMEDIATE LOOSE ENDS (small, do first next session):
-1. prompts.py still instructs the model to "write findings" -- the runtime now
-   blocks that (memory_write('finding') and complete(findings) are dropped), so
-   the model wastes a few iterations trying. Strip the stale finding-writing
-   lines from prompts.py. KEEP the stop-at-root flow: it still matches directive
-   Rule 1 and the full-suite rewrite (Phase B) will change it deliberately.
-2. run.py uses atexit to stop msfrpcd, but SIGTERM bypasses atexit, so `kill`/
-   programmatic restart orphans msfrpcd (Ctrl+C is fine). Add a SIGTERM handler
-   that sys.exit(0) so atexit runs. ~5 lines.
+IMMEDIATE LOOSE ENDS: BOTH DONE (2026-06-14, commit c57c872).
+1. DONE. prompts.py no longer tells the model to author findings/credentials
+   (runtime records them; model writes were dropped). Stop-at-root flow kept.
+2. DONE. run.py installs a SIGTERM handler that sys.exit(0) so atexit tears down
+   msfrpcd on `kill`/programmatic restart, not just Ctrl+C.
 
-THEN the big one: Phase A (memory/context hardening) -> Phase B (full-suite
-exploit-and-document-every-vuln). See backlog item B below.
+### Phase A: memory/context hardening (DONE 2026-06-14, automated-verified; live-run pending)
+Prereq for Phase B: durable per-service progress that survives context pruning,
+plus stop wasting context on duplicate CVE lookups.
+- Schema: new `service_state(host_ip, port, service, status, outcome, reason,
+  engagement_id, updated_at)`, UNIQUE(host_ip, port). status ladder:
+  untried -> attempted -> exploited / documented / skipped. Cleared per run in
+  _clear_engagement_tables alongside port/tried_module (live run state, not
+  history). New table so CREATE IF NOT EXISTS covers fresh + existing DBs; no
+  _migrate ALTER needed.
+- tools/memory.py: service_state wired into read/query/write (UPSERT on
+  host_ip+port). seed_service_state() is INSERT-OR-IGNORE (a re-scan must never
+  regress an exploited port to untried). advance_service_state() is FORWARD-ONLY
+  via _STATUS_RANK (a 2nd module's 'attempted' cannot knock a port off
+  'exploited'); outcome/reason refresh ONLY when the event advances/ties the
+  status, so a rank-ignored backward event (duplicate module that errors on an
+  already-documented port) cannot clobber the good outcome.
+- orchestrator.py runtime populates it (NOT the model): seed untried per open
+  port on scan; advance 'attempted' after each run_module; 'exploited' when a
+  session opens; 'documented' after the breach finding + root enum are recorded.
+  Supervisor directive Rule 3 now reads service_state for untried ports (was
+  derived from port - tried_module). Rule 1 (STOP at root) intentionally
+  unchanged -- that flip is Phase B.
+- lookup_cves dedup (AAR gap #3 DONE): per-run _cve_cache in _dispatch keyed by
+  (service, version), reset at run start (safe: single-engagement concurrency
+  guard). Repeat lookup returns cached result + note; only ok results cached so a
+  transient NVD error still retries.
+
+### Session reliability (DONE 2026-06-14, surfaced by Phase A live verification)
+The first two Phase A live runs wedged/degraded in post-exploitation. Root cause:
+a freshly opened backdoor shell is not ready for ~1-2s, so the first id/whoami
+writes were dropped; pymetasploit3's run_with_output `timeout` does not bound the
+write/RPC, so the call hung forever (run 1) or, with a naive thread timeout,
+abandoned readers piled onto the same ShellSession and stole each other's bytes,
+cascading 40s timeouts (run 2). Fixes in tools/sessions.py + orchestrator.py:
+- warm_up(session_id): after a shell opens, drain the banner then write a unique
+  split-token echo and wait for its OUTPUT to round-trip before issuing real
+  commands. _split_token_echo keeps the literal token out of the typed line so a
+  command-echoing shell cannot false-match. THIS is the core fix (root now
+  confirmed reliably).
+- _session_lock serializes all shell I/O so there is never a second concurrent
+  reader; a wedged call keeps the lock (parks the session) rather than letting a
+  new reader corrupt the stream. Hard wall-clock bound (_bounded_locked, join =
+  timeout + _HANG_GRACE) is the ceiling.
+- Orchestrator: warm up before the id probe; if the shell never becomes
+  responsive, CLOSE it and write NO session row (an unusable shell must not drive
+  the Rule 2 privesc loop -- that loop burned all 50 iterations in run 2).
+- Tests: TestSessionReliability (warm-up round-trip, busy-lock, hard timeout,
+  split-token). TestSessionAutoWrite tests now mock sessions.warm_up=ready.
+- LIVE VERIFIED 2026-06-14 (engagement 840f8236): scan -> vsftpd backdoor -> warm
+  up -> root confirmed -> /etc/shadow parsed into 7 credentials -> port 21
+  documented -> clean complete(), 7 iterations, ~77s. The two prior wedge/loop
+  failure modes are both gone. 117 tests pass.
+
+PHASE A IS DONE AND LIVE-VERIFIED. This work is the stable checkpoint committed
+before starting Phase B.
+
+THEN (NEXT, Phase B -- full-suite exploit-and-document-every-vuln): the ONLY
+thing still stopping multi-service runs is directive Rule 1 ("STOP EXPLOITING"
+at first root). Plan: (1) runtime closes a root session after it auto-documents,
+so it stops triggering Rule 1/2 and the directive falls through to the next
+untried service; (2) replace Rule 1 -- a rooted service is auto-documented, move
+on; (3) add a terminal rule: complete() only when every service is documented/
+skipped (reads service_state), not at first root; (4) privesc escape -- a user
+shell that cannot escalate after N tries is marked skipped + closed; (5) rewrite
+prompts.py workflow from "IF ROOT: stop+complete" to "document + continue".
+Needs its own live verification (Metasploitable has several root vectors:
+vsftpd, samba usermap, distccd, UnrealIRCd). See backlog item B below.
 
 ### Session of 2026-06-12 (most recent, resume from NEXT below)
 - run.py: single launcher. Preflights Ollama/msfrpcd/target, auto-starts msfrpcd

@@ -61,6 +61,28 @@ CREATE TABLE IF NOT EXISTS session (
     closed_at   TEXT
 );
 
+-- One row per discovered service (host_ip, port), tracking how far the engagement
+-- has taken it. This is the durable progress record that survives context
+-- pruning: the model's in-context history is trimmed on long runs, so "have we
+-- dealt with this port yet" must live in SQLite, not the conversation. Phase B
+-- (exploit-and-document-every-service) reads this to decide when a run is done.
+--   status: untried -> attempted -> exploited / documented / skipped
+--   outcome: short machine note (e.g. module name, 'root shell', 'no module')
+--   reason:  why skipped, when status = skipped
+-- Cleared per run alongside port/tried_module (it is live run state, not history).
+CREATE TABLE IF NOT EXISTS service_state (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_ip       TEXT NOT NULL,
+    port          INTEGER NOT NULL,
+    service       TEXT,
+    status        TEXT NOT NULL DEFAULT 'untried',
+    outcome       TEXT,
+    reason        TEXT,
+    engagement_id TEXT,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(host_ip, port)
+);
+
 -- One row per run. The dashboard's history and (future) After Action Report hang
 -- off this entity. aar is reserved for the future model-generated report.
 CREATE TABLE IF NOT EXISTS engagement (

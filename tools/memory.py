@@ -65,6 +65,7 @@ def read(category: str, key: str, filters: dict | None = None) -> dict:
             "credential":   ("credential",   "host_ip"),
             "finding":      ("finding",      "host_ip"),
             "session":      ("session",      "host_ip"),
+            "service_state":("service_state","host_ip"),
         }
 
         if category not in table_key_map:
@@ -206,6 +207,35 @@ def write(category: str, data: dict | list) -> dict:
                 },
             )
 
+        elif category == "service_state":
+            # Status-transition writer: UPSERT on (host_ip, port). Unlike seeding,
+            # this overwrites status/outcome/reason because a transition (attempted
+            # -> exploited -> documented) is always meant to win over the prior row.
+            conn.execute(
+                """
+                INSERT INTO service_state
+                    (host_ip, port, service, status, outcome, reason, engagement_id)
+                VALUES
+                    (:host_ip, :port, :service, :status, :outcome, :reason, :engagement_id)
+                ON CONFLICT(host_ip, port) DO UPDATE SET
+                    status        = excluded.status,
+                    outcome       = COALESCE(excluded.outcome, service_state.outcome),
+                    reason        = COALESCE(excluded.reason, service_state.reason),
+                    service       = COALESCE(excluded.service, service_state.service),
+                    engagement_id = COALESCE(excluded.engagement_id, service_state.engagement_id),
+                    updated_at    = datetime('now')
+                """,
+                {
+                    "host_ip":  data.get("host_ip"),
+                    "port":     data.get("port"),
+                    "service":  data.get("service"),
+                    "status":   data.get("status", "untried"),
+                    "outcome":  data.get("outcome"),
+                    "reason":   data.get("reason"),
+                    "engagement_id": data.get("engagement_id"),
+                },
+            )
+
         else:
             return {"status": "error", "error": f"unknown category: {category}"}
 
@@ -268,6 +298,89 @@ def write_event(engagement_id: str, etype: str, payload, ts: float) -> dict:
         conn.close()
 
 
+def seed_service_state(host_ip: str, port: int, service: str | None,
+                       engagement_id: str | None = None) -> dict:
+    """Create an 'untried' service_state row only if one does not already exist.
+
+    Called from the scan auto-write so every open port has a progress row. Uses
+    INSERT OR IGNORE (not UPSERT) on purpose: a re-scan must never knock a service
+    that is already 'exploited'/'documented' back to 'untried'. Status transitions
+    go through write('service_state', ...) instead.
+    """
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO service_state
+                (host_ip, port, service, status, engagement_id)
+            VALUES (?, ?, ?, 'untried', ?)
+            """,
+            (host_ip, port, service, engagement_id),
+        )
+        conn.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
+
+
+# Forward progress order. A service only ever moves rightward, so a later, weaker
+# event (e.g. a second module 'attempted' on a port already 'exploited') cannot
+# knock it back. 'skipped' sits beside 'attempted': a deliberate skip should not
+# overwrite a real exploit, but should win over an untried row.
+_STATUS_RANK = {"untried": 0, "skipped": 1, "attempted": 1, "exploited": 2, "documented": 3}
+
+
+def advance_service_state(host_ip: str, port: int, status: str,
+                          outcome: str | None = None, reason: str | None = None,
+                          engagement_id: str | None = None) -> dict:
+    """Move a service forward to `status`, never backward.
+
+    The status column only changes if the new status outranks the stored one, so
+    transitions are monotonic and Phase B can trust 'documented' to stick. Outcome
+    and reason refresh only when the event actually advances (or ties) the status;
+    a rank-ignored event (e.g. a duplicate module that errors on an already
+    'documented' port) must not overwrite the meaningful outcome with its noise.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT status FROM service_state WHERE host_ip = ? AND port = ?",
+            (host_ip, port),
+        ).fetchone()
+        current = row["status"] if row else None
+        current_rank = _STATUS_RANK.get(current, 0) if current else -1
+        new_rank = _STATUS_RANK.get(status, 0)
+        advancing = new_rank >= current_rank
+        keep = current if (current and current_rank > new_rank) else status
+        # Discard outcome/reason from an ignored backward event so they cannot
+        # clobber the detail recorded when the service last moved forward.
+        out = outcome if advancing else None
+        rsn = reason if advancing else None
+        conn.execute(
+            """
+            INSERT INTO service_state
+                (host_ip, port, status, outcome, reason, engagement_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_ip, port) DO UPDATE SET
+                status        = ?,
+                outcome       = COALESCE(?, service_state.outcome),
+                reason        = COALESCE(?, service_state.reason),
+                engagement_id = COALESCE(?, service_state.engagement_id),
+                updated_at    = datetime('now')
+            """,
+            (host_ip, port, status, out, rsn, engagement_id,
+             keep, out, rsn, engagement_id),
+        )
+        conn.commit()
+        return {"status": "ok", "service_status": keep}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
+
+
 def query(category: str, filters: dict | None = None) -> dict:
     """
     Query across a category with optional filters.
@@ -284,6 +397,7 @@ def query(category: str, filters: dict | None = None) -> dict:
             "credential":   "credential",
             "finding":      "finding",
             "session":      "session",
+            "service_state":"service_state",
         }
 
         if category not in table_map:

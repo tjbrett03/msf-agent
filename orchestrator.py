@@ -215,6 +215,26 @@ def _dispatch(tool_name: str, tool_args: dict) -> dict:
     if tool_name not in TOOL_MAP:
         return {"status": "error", "error": f"unknown tool: {tool_name}"}
 
+    # Dedup CVE lookups within a run. The model, having had its context pruned,
+    # re-requests the same (service, version) lookup; re-hitting NVD wastes a
+    # round trip and refills the window with a payload it already saw. Serve the
+    # cached result with a note instead. Only successful lookups are cached so a
+    # transient NVD error can still be retried.
+    if tool_name == "lookup_cves":
+        service = tool_args.get("service")
+        version = tool_args.get("version")
+        if service is None or version is None:
+            return {"status": "error", "error": "lookup_cves requires service and version"}
+        key = (service, version)
+        if key in _cve_cache:
+            cached = dict(_cve_cache[key])
+            cached["note"] = "cached from an earlier lookup this run; duplicate skipped"
+            return cached
+        result = intel.lookup_cves(service, version)
+        if result.get("status") == "ok":
+            _cve_cache[key] = result
+        return result
+
     # Scope enforcement: every tool that touches the network must target an authorized IP.
     if tool_name == "scan_ports":
         target = tool_args.get("target", "")
@@ -307,7 +327,7 @@ def _clear_engagement_tables(target: str) -> None:
     try:
         # finding is intentionally excluded: findings are engagement-scoped now
         # and must persist across runs so prior engagements stay reviewable.
-        for table in ("port", "tried_module", "credential", "session"):
+        for table in ("port", "tried_module", "credential", "session", "service_state"):
             conn.execute(f"DELETE FROM {table} WHERE host_ip = ?", (target,))
         conn.execute("DELETE FROM host WHERE ip = ?", (target,))
         conn.commit()
@@ -408,13 +428,15 @@ def build_supervisor_directive(target: str, messages: list[dict]) -> str:
                 "Try sudo -l first."
             )
 
-    # Rule 3: known ports exist but at least one has no exploit attempt yet.
-    ports_result  = memory.read("port", target)
-    tried_result  = memory.query("tried_module", {"host_ip": target})
-    if ports_result.get("status") == "ok" and ports_result.get("rows"):
-        all_ports   = {r["port"] for r in ports_result["rows"]}
-        tried_ports = {r["port"] for r in tried_result.get("rows", [])}
-        untried     = sorted(all_ports - tried_ports)
+    # Rule 3: a discovered service still has no exploit attempt. Sourced from
+    # service_state, the durable progress table: the runtime seeds an 'untried'
+    # row per open port on scan and advances it as modules run, so this survives
+    # context pruning even when the model has forgotten what it scanned.
+    svc_result = memory.query("service_state", {"host_ip": target})
+    if svc_result.get("status") == "ok" and svc_result.get("rows"):
+        untried = sorted(
+            r["port"] for r in svc_result["rows"] if r.get("status") == "untried"
+        )
         if untried:
             return (
                 f"Untried services on {target}: ports {untried}. "
@@ -452,6 +474,11 @@ def build_supervisor_directive(target: str, messages: list[dict]) -> str:
 # Cooperative abort flags keyed by engagement_id. The dashboard sets one via
 # request_abort(); the loop checks it each iteration and exits cleanly, no hard kill.
 _abort_requested: dict[str, bool] = {}
+
+# Per-run cache of lookup_cves results, keyed by (service, version). Reset at the
+# top of run(). Safe as module-level state because only one engagement runs at a
+# time (see claim_engagement). See the dedup branch in _dispatch.
+_cve_cache: dict[tuple, dict] = {}
 
 
 def request_abort(engagement_id: str) -> None:
@@ -642,6 +669,10 @@ def run(target: str, engagement_id: str | None = None) -> dict:
     emit("engagement_started", {"target": target})
     _clear_sessions()
     _clear_engagement_tables(target)
+    # Fresh CVE lookup cache per run. Only one engagement runs at a time (the
+    # concurrency guard enforces it), so a module-level cache cannot bleed between
+    # concurrent runs; resetting here keeps stale results from a prior run out.
+    _cve_cache.clear()
 
     tool_desc = prompts.build_tool_descriptions(TOOL_SCHEMAS)
     system_prompt = prompts.build_system_prompt(tool_desc, target)
@@ -771,6 +802,16 @@ def run(target: str, engagement_id: str | None = None) -> dict:
                     "result": result.get("status"),
                     "detail": result.get("error") or result.get("session_id") or "",
                 })
+                # Advance this service to 'attempted'. Forward-only, so a follow-up
+                # module on a port already 'exploited' will not regress it. The
+                # 'exploited' transition happens in the session_opened block below.
+                mod_port = tool_args.get("port")
+                if mod_port is not None:
+                    memory.advance_service_state(
+                        target, mod_port, "attempted",
+                        outcome=f"{tool_args.get('module', '?')}: {result.get('status', '?')}",
+                        engagement_id=engagement_id,
+                    )
             # Record each open port as an informational finding (severity "info",
             # this app's informational tier) so the recon surface shows up in the
             # findings table, not just exploited services. Once per run, since the
@@ -783,6 +824,13 @@ def run(target: str, engagement_id: str | None = None) -> dict:
                 ports_for_db = [{**p, "host_ip": target} for p in open_ports]
                 if ports_for_db:
                     memory.write("port", ports_for_db)
+
+                # Seed one 'untried' progress row per open port. seed_service_state
+                # is INSERT-OR-IGNORE, so re-seeding on a re-scan never regresses a
+                # port we have already exploited. The supervisor directive reads
+                # these rows to pick the next untried service, durably across pruning.
+                for p in open_ports:
+                    memory.seed_service_state(target, p.get("port"), p.get("service"), engagement_id)
 
                 for p in open_ports:
                     svc = p.get("service") or "unknown"
@@ -815,47 +863,89 @@ def run(target: str, engagement_id: str | None = None) -> dict:
             # session table so the supervisor directive steers via Rule 1
             # (root shell) or Rule 2 (user shell) on the next iteration.
             if tool_name == "run_module" and result.get("session_opened"):
-                sid = str(result.get("session_id", ""))
-                # Give the shell time to stabilize; probing immediately returns empty output.
-                time.sleep(2)
-                id_result = sessions.run_command(sid, "id")
-                if "uid=0" in id_result.get("output", ""):
-                    username = "root"
+                sid        = str(result.get("session_id", ""))
+                shell_port = tool_args.get("port")
+                module     = tool_args.get("module", "unknown module")
+
+                # A freshly opened backdoor shell is frequently not ready to take
+                # commands for a second or two. Probing too early gets the first
+                # writes silently dropped, after which every read times out and
+                # root can never be confirmed (this stalled a whole run). Warm the
+                # shell until it round-trips a command before relying on it.
+                warm = sessions.warm_up(sid)
+
+                if not warm.get("ready"):
+                    # Shell never became usable. Close it so it cannot drive an
+                    # endless privesc loop (the directive keys off the open-session
+                    # table), record the attempt, and move on. Deliberately write
+                    # NO session row for an unusable shell.
+                    sessions.close_session(sid)
+                    emit("log", {"message": f"session {sid} opened but never responded; closed it"})
+                    if shell_port is not None:
+                        memory.advance_service_state(
+                            target, shell_port, "exploited",
+                            outcome=f"unresponsive shell via {module}",
+                            engagement_id=engagement_id,
+                        )
+                    _record_finding({
+                        "host_ip":  target,
+                        "port":     shell_port,
+                        "title":    f"Shell via {module} opened but was unresponsive",
+                        "severity": "high",
+                        "evidence": (warm.get("error") or "shell did not respond to commands")[:500],
+                    }, emit, engagement_id)
                 else:
-                    whoami_result = sessions.run_command(sid, "whoami")
-                    if "root" in whoami_result.get("output", ""):
+                    id_result = sessions.run_command(sid, "id")
+                    if "uid=0" in id_result.get("output", ""):
                         username = "root"
                     else:
-                        print(f"[session] warning: could not confirm username for sid={sid}")
-                        username = "unknown"
-                memory.write("session", {
-                    "msf_id":       sid,
-                    "host_ip":      target,
-                    "session_type": "shell",
-                    "username":     username,
-                })
-                print(f"[session] sid={sid} username={username}")
+                        whoami_result = sessions.run_command(sid, "whoami")
+                        if "root" in whoami_result.get("output", ""):
+                            username = "root"
+                        else:
+                            print(f"[session] warning: could not confirm username for sid={sid}")
+                            username = "unknown"
+                    memory.write("session", {
+                        "msf_id":       sid,
+                        "host_ip":      target,
+                        "session_type": "shell",
+                        "username":     username,
+                    })
+                    print(f"[session] sid={sid} username={username}")
 
-                # Record the breach as a finding right here, independent of any
-                # memory_write('finding') the model may or may not make. The model
-                # is unreliable about this, and without it a successful root
-                # compromise still leaves the dashboard findings table empty.
-                # Mirrors the session auto-write above; emit so it also lands live.
-                module = tool_args.get("module", "unknown module")
-                finding = {
-                    "host_ip":  target,
-                    "port":     tool_args.get("port"),
-                    "title":    f"Shell session as {username} via {module}",
-                    "severity": "critical" if username == "root" else "high",
-                    "evidence": (id_result.get("output") or "").strip()[:500] or f"session {sid} opened",
-                }
-                _record_finding(finding, emit, engagement_id)
+                    # The service that popped the shell is now 'exploited'. Forward-
+                    # only, so the prior 'attempted' write does not hold it back.
+                    if shell_port is not None:
+                        memory.advance_service_state(
+                            target, shell_port, "exploited",
+                            outcome=f"{username} shell via {module}",
+                            engagement_id=engagement_id,
+                        )
 
-                # On a root shell, sweep the host in the runtime rather than
-                # trusting the model to do post-exploitation. Persists each
-                # command output as a finding and the /etc/shadow hashes as loot.
-                if username == "root":
-                    _enumerate_root(sid, target, emit, engagement_id)
+                    # Record the breach as a finding right here, independent of any
+                    # memory_write('finding') the model may or may not make. Without
+                    # it a successful compromise leaves the findings table empty.
+                    _record_finding({
+                        "host_ip":  target,
+                        "port":     shell_port,
+                        "title":    f"Shell session as {username} via {module}",
+                        "severity": "critical" if username == "root" else "high",
+                        "evidence": (id_result.get("output") or "").strip()[:500] or f"session {sid} opened",
+                    }, emit, engagement_id)
+
+                    # On a root shell, sweep the host in the runtime rather than
+                    # trusting the model to do post-exploitation. Persists each
+                    # command output as a finding and the /etc/shadow hashes as loot.
+                    if username == "root":
+                        _enumerate_root(sid, target, emit, engagement_id)
+
+                    # Shell opened AND its breach finding (plus root enumeration) is
+                    # recorded, so this service is fully written up. 'documented' is
+                    # the terminal state Phase B reads to decide the run is complete.
+                    if shell_port is not None:
+                        memory.advance_service_state(
+                            target, shell_port, "documented", engagement_id=engagement_id,
+                        )
 
     return finish({
         "status":  "limit_reached",

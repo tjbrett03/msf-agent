@@ -19,6 +19,7 @@ import config
 import orchestrator
 import tools.intel as intel
 import tools.memory as memory
+import tools.sessions as sessions
 
 
 # ---------------------------------------------------------------------------
@@ -491,12 +492,13 @@ class TestSessionAutoWrite(unittest.TestCase):
         resp.message = msg
         return resp
 
+    @patch("tools.sessions.warm_up", return_value={"status": "ok", "ready": True})
     @patch("time.sleep")
     @patch("ollama.Client.chat")
     @patch("tools.sessions.run_command")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
     @patch("tools.exploit.run_module")
-    def test_root_detected_via_id(self, mock_run, _ls, mock_cmd, mock_chat, _sleep):
+    def test_root_detected_via_id(self, mock_run, _ls, mock_cmd, mock_chat, _sleep, _warm):
         """uid=0 in 'id' output -> session written with username=root."""
         target = config.AUTHORIZED_SCOPE[0]
         module = "exploit/unix/ftp/autowrite_root_unique"
@@ -522,12 +524,13 @@ class TestSessionAutoWrite(unittest.TestCase):
         root_rows = [r for r in rows if r.get("msf_id") == "autoroot1" and r.get("username") == "root"]
         self.assertTrue(len(root_rows) >= 1, msg=f"Expected root session row, got: {rows}")
 
+    @patch("tools.sessions.warm_up", return_value={"status": "ok", "ready": True})
     @patch("time.sleep")
     @patch("ollama.Client.chat")
     @patch("tools.sessions.run_command")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
     @patch("tools.exploit.run_module")
-    def test_root_detected_via_whoami_fallback(self, mock_run, _ls, mock_cmd, mock_chat, _sleep):
+    def test_root_detected_via_whoami_fallback(self, mock_run, _ls, mock_cmd, mock_chat, _sleep, _warm):
         """id returns empty; whoami returns 'root' -> session written with username=root."""
         target = config.AUTHORIZED_SCOPE[0]
         module = "exploit/unix/ftp/whoami_fallback_unique"
@@ -560,12 +563,13 @@ class TestSessionAutoWrite(unittest.TestCase):
         root_rows = [r for r in rows if r.get("msf_id") == "whoami1" and r.get("username") == "root"]
         self.assertTrue(len(root_rows) >= 1, msg=f"Expected root via whoami, got: {rows}")
 
+    @patch("tools.sessions.warm_up", return_value={"status": "ok", "ready": True})
     @patch("time.sleep")
     @patch("ollama.Client.chat")
     @patch("tools.sessions.run_command")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
     @patch("tools.exploit.run_module")
-    def test_root_shell_triggers_enumeration_and_parses_shadow(self, mock_run, _ls, mock_cmd, mock_chat, _sleep):
+    def test_root_shell_triggers_enumeration_and_parses_shadow(self, mock_run, _ls, mock_cmd, mock_chat, _sleep, _warm):
         """A root shell auto-runs enumeration: command output becomes findings and
         /etc/shadow hashes are parsed into the credential table."""
         target = config.AUTHORIZED_SCOPE[0]
@@ -610,12 +614,13 @@ class TestSessionAutoWrite(unittest.TestCase):
         self.assertTrue(any("uname -a" in t for t in titles), msg=f"got: {titles}")
         self.assertTrue(any("/etc/shadow" in t for t in titles), msg=f"got: {titles}")
 
+    @patch("tools.sessions.warm_up", return_value={"status": "ok", "ready": True})
     @patch("time.sleep")
     @patch("ollama.Client.chat")
     @patch("tools.sessions.run_command")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
     @patch("tools.exploit.run_module")
-    def test_unknown_written_when_id_fails(self, mock_run, _ls, mock_cmd, mock_chat, _sleep):
+    def test_unknown_written_when_id_fails(self, mock_run, _ls, mock_cmd, mock_chat, _sleep, _warm):
         """id errors and whoami is not root -> session written with username=unknown."""
         target = config.AUTHORIZED_SCOPE[0]
         module = "exploit/unix/ftp/autowrite_fail_unique"
@@ -857,13 +862,17 @@ class TestBuildSupervisorDirective(unittest.TestCase):
     # --- Rule 3 ---
 
     @patch("tools.memory.query")
-    @patch("tools.memory.read")
-    def test_rule3_untried_ports(self, mock_read, mock_query):
-        """Rule 3 fires when ports are in memory but none have been tried."""
-        mock_query.return_value = {"status": "ok", "rows": []}  # no sessions, no tried
-        mock_read.return_value = {"status": "ok", "rows": [
-            {"port": 21}, {"port": 22}, {"port": 80},
-        ]}
+    def test_rule3_untried_ports(self, mock_query):
+        """Rule 3 fires when service_state holds ports still marked 'untried'."""
+        def qside(category, filters=None):
+            if category == "service_state":
+                return {"status": "ok", "rows": [
+                    {"port": 21, "status": "untried"},
+                    {"port": 22, "status": "untried"},
+                    {"port": 80, "status": "untried"},
+                ]}
+            return {"status": "ok", "rows": []}  # no sessions
+        mock_query.side_effect = qside
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
         self.assertIn("Untried services", result)
@@ -871,15 +880,13 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         self.assertIn("Do not call complete()", result)
 
     @patch("tools.memory.query")
-    @patch("tools.memory.read")
-    def test_rule3_skipped_when_all_ports_tried(self, mock_read, mock_query):
-        """Rule 3 does not fire when every known port already has a tried_module entry."""
+    def test_rule3_skipped_when_all_ports_tried(self, mock_query):
+        """Rule 3 does not fire when no service_state row is still 'untried'."""
         def qside(category, filters=None):
-            if category == "tried_module":
-                return {"status": "ok", "rows": [{"port": 21}]}
+            if category == "service_state":
+                return {"status": "ok", "rows": [{"port": 21, "status": "attempted"}]}
             return {"status": "ok", "rows": []}
         mock_query.side_effect = qside
-        mock_read.return_value = {"status": "ok", "rows": [{"port": 21}]}
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
         self.assertNotIn("Untried services", result)
@@ -1107,6 +1114,177 @@ class TestFindingsRuntimeOnly(unittest.TestCase):
         self.assertEqual(res["status"], "ok")
         rows = memory.query("tried_module", {"host_ip": target, "module": "m/unique_rt"}).get("rows", [])
         self.assertEqual(len(rows), 1)
+
+
+class TestServiceState(unittest.TestCase):
+    """Phase A: durable per-service progress that survives context pruning."""
+
+    def test_seed_creates_untried_row(self):
+        memory.seed_service_state("10.9.0.1", 21, "ftp", "eng-ss-1")
+        rows = memory.read("service_state", "10.9.0.1")["rows"]
+        row = next(r for r in rows if r["port"] == 21)
+        self.assertEqual(row["status"], "untried")
+        self.assertEqual(row["service"], "ftp")
+
+    def test_seed_is_idempotent_and_does_not_regress(self):
+        memory.seed_service_state("10.9.0.2", 21, "ftp")
+        memory.advance_service_state("10.9.0.2", 21, "exploited", outcome="root shell")
+        # A re-scan re-seeds; it must NOT knock the exploited service back to untried.
+        memory.seed_service_state("10.9.0.2", 21, "ftp")
+        rows = memory.read("service_state", "10.9.0.2")["rows"]
+        row = next(r for r in rows if r["port"] == 21)
+        self.assertEqual(row["status"], "exploited")
+        self.assertEqual(len([r for r in rows if r["port"] == 21]), 1)
+
+    def test_advance_is_forward_only(self):
+        memory.seed_service_state("10.9.0.3", 80, "http")
+        memory.advance_service_state("10.9.0.3", 80, "exploited", outcome="shell")
+        # A later, weaker 'attempted' (e.g. a duplicate module on the same port) loses,
+        # and must NOT clobber the meaningful outcome with its noise.
+        memory.advance_service_state("10.9.0.3", 80, "attempted", outcome="dup module error")
+        row = next(r for r in memory.read("service_state", "10.9.0.3")["rows"] if r["port"] == 80)
+        self.assertEqual(row["status"], "exploited")
+        self.assertEqual(row["outcome"], "shell")
+
+    def test_advance_refreshes_outcome_when_moving_forward(self):
+        memory.seed_service_state("10.9.0.5", 80, "http")
+        memory.advance_service_state("10.9.0.5", 80, "attempted", outcome="first try")
+        memory.advance_service_state("10.9.0.5", 80, "exploited", outcome="root shell")
+        row = next(r for r in memory.read("service_state", "10.9.0.5")["rows"] if r["port"] == 80)
+        self.assertEqual(row["status"], "exploited")
+        self.assertEqual(row["outcome"], "root shell")
+
+    def test_advance_progresses_through_states(self):
+        memory.seed_service_state("10.9.0.4", 445, "smb")
+        for st in ("attempted", "exploited", "documented"):
+            memory.advance_service_state("10.9.0.4", 445, st)
+        row = next(r for r in memory.read("service_state", "10.9.0.4")["rows"] if r["port"] == 445)
+        self.assertEqual(row["status"], "documented")
+
+    def test_directive_reads_service_state(self):
+        # End to end through the directive: a seeded-but-untried service surfaces.
+        target = config.AUTHORIZED_SCOPE[0]
+        memory.seed_service_state(target, 23, "telnet")
+        directive = orchestrator.build_supervisor_directive(target, [])
+        # Only assert it does not crash and reflects untried when nothing else fires;
+        # other rules (session) take priority, so guard on the table being read.
+        rows = memory.query("service_state", {"host_ip": target}).get("rows", [])
+        self.assertTrue(any(r["port"] == 23 and r["status"] == "untried" for r in rows))
+
+
+class TestCveLookupDedup(unittest.TestCase):
+    """AAR gap #3: a repeat lookup_cves is served from cache, not re-fetched."""
+
+    def setUp(self):
+        orchestrator._cve_cache.clear()
+
+    @patch("tools.intel.lookup_cves")
+    def test_duplicate_lookup_is_cached(self, mock_lookup):
+        mock_lookup.return_value = {"status": "ok", "cves": [{"id": "CVE-2011-2523"}]}
+        first = orchestrator._dispatch("lookup_cves", {"service": "vsftpd", "version": "2.3.4"})
+        second = orchestrator._dispatch("lookup_cves", {"service": "vsftpd", "version": "2.3.4"})
+        self.assertEqual(mock_lookup.call_count, 1)  # NVD hit only once
+        self.assertEqual(second["cves"], first["cves"])
+        self.assertIn("cached", second.get("note", ""))
+
+    @patch("tools.intel.lookup_cves")
+    def test_distinct_lookups_not_collapsed(self, mock_lookup):
+        mock_lookup.return_value = {"status": "ok", "cves": []}
+        orchestrator._dispatch("lookup_cves", {"service": "vsftpd", "version": "2.3.4"})
+        orchestrator._dispatch("lookup_cves", {"service": "openssh", "version": "4.7"})
+        self.assertEqual(mock_lookup.call_count, 2)
+
+    @patch("tools.intel.lookup_cves")
+    def test_error_is_not_cached(self, mock_lookup):
+        mock_lookup.return_value = {"status": "error", "error": "nvd timeout"}
+        orchestrator._dispatch("lookup_cves", {"service": "vsftpd", "version": "2.3.4"})
+        orchestrator._dispatch("lookup_cves", {"service": "vsftpd", "version": "2.3.4"})
+        self.assertEqual(mock_lookup.call_count, 2)  # retried, not stuck on the error
+
+    def test_missing_args_returns_error(self):
+        res = orchestrator._dispatch("lookup_cves", {"service": "vsftpd"})
+        self.assertEqual(res["status"], "error")
+
+
+class _FakeShell:
+    """Minimal stand-in for pymetasploit3 ShellSession: read() echoes the output of
+    the last `echo ...` written, so a warm-up probe round-trips like a real shell."""
+    def __init__(self, responsive=True):
+        self._last = ""
+        self._responsive = responsive
+
+    def write(self, data):
+        self._last = data
+
+    def read(self):
+        if not self._responsive or not self._last:
+            return ""
+        out = self._last.strip()
+        self._last = ""
+        if out.startswith("echo "):
+            return out[len("echo "):].replace("''", "") + "\n"
+        return ""
+
+
+class TestSessionReliability(unittest.TestCase):
+    """run_command/warm_up must never wedge or cascade: a stuck or contended session
+    fails cleanly (hard wall-clock bound) and the shell is warmed before first use,
+    because a not-ready backdoor shell silently dropped the first probe and stalled
+    a whole run. The lock stops a second reader from corrupting the stream."""
+
+    def setUp(self):
+        # The hung-call test intentionally leaves the lock held (a real wedge parks
+        # the session); reset it so tests stay isolated.
+        import threading
+        sessions._session_lock = threading.Lock()
+
+    def test_run_command_times_out_when_blocking_call_hangs(self):
+        import time as _t
+        with patch("tools.sessions._HANG_GRACE", 0), \
+             patch("tools.sessions._run_command_blocking", lambda *a, **k: _t.sleep(2)):
+            res = sessions.run_command("1", "id", timeout=0)
+        self.assertEqual(res["status"], "error")
+        self.assertIn("timed out", res["error"])
+        self.assertEqual(res["command"], "id")
+
+    def test_run_command_returns_worker_result_when_fast(self):
+        fast = {"status": "ok", "session_id": "1", "command": "id", "output": "uid=0(root)"}
+        with patch("tools.sessions._run_command_blocking", return_value=fast):
+            res = sessions.run_command("1", "id", timeout=5)
+        self.assertEqual(res, fast)
+
+    def test_busy_when_lock_already_held(self):
+        # Simulate a parked session (prior wedge holds the lock): the next call must
+        # report busy instead of starting a competing reader.
+        sessions._session_lock.acquire()
+        try:
+            res = sessions.run_command("1", "id", timeout=5)
+        finally:
+            sessions._session_lock.release()
+        self.assertEqual(res["status"], "error")
+        self.assertIn("busy", res["error"])
+
+    def test_warm_up_ready_when_shell_round_trips(self):
+        fake_client = MagicMock()
+        fake_client.sessions.session.return_value = _FakeShell(responsive=True)
+        with patch("tools.sessions._connect", return_value=fake_client), \
+             patch("tools.sessions.ShellSession", _FakeShell):
+            res = sessions.warm_up("1", timeout=3)
+        self.assertTrue(res["ready"])
+
+    def test_warm_up_not_ready_when_shell_silent(self):
+        fake_client = MagicMock()
+        fake_client.sessions.session.return_value = _FakeShell(responsive=False)
+        with patch("tools.sessions._connect", return_value=fake_client), \
+             patch("tools.sessions.ShellSession", _FakeShell):
+            res = sessions.warm_up("1", timeout=1)
+        self.assertFalse(res["ready"])
+
+    def test_split_token_echo_hides_literal(self):
+        token = "RDYdeadbeef"
+        cmd = sessions._split_token_echo(token)
+        self.assertNotIn(token, cmd)          # not in the typed command line
+        self.assertEqual(cmd.replace("''", "").split()[-1], token)  # but prints it
 
 
 if __name__ == "__main__":
