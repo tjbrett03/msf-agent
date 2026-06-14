@@ -61,10 +61,9 @@ Phase 1: Complete. Phase 2: Complete. Phase 3: Complete. Phase 4 is current
 (hardening and tuning).
 
 ## Phase 4 progress (resume here)
-STATUS (end of 2026-06-13 session): all of this session's work is committed on
-branch `feature/engagement-suite` (4 commits) and pushed; PR #1 is open against
-master (NOT merged yet -- https://github.com/tjbrett03/msf-agent/pull/1). 101
-tests pass. master does not have any of it until the PR merges.
+STATUS (2026-06-14): PR #1 (feature/engagement-suite) is MERGED into master
+(merge commit 96bd8f0). master now contains all the engagement-suite work. 101
+tests pass.
 
 IMMEDIATE LOOSE ENDS (small, do first next session):
 1. prompts.py still instructs the model to "write findings" -- the runtime now

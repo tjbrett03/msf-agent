@@ -30,29 +30,26 @@ IF YOU HAVE A ROOT SHELL:
   1. Stop attempting new exploits immediately
   2. Run these post-exploitation commands in the session:
      whoami, id, uname -a, cat /etc/passwd, cat /etc/shadow
-  3. Write a critical finding with the command output as evidence
-  4. Write any credentials found to credential memory
-  5. Call complete() with a full summary and findings list
+  3. Call complete() with a full summary
 
 IF YOU HAVE A USER SHELL (not root):
-  1. Document the finding with severity high
-  2. Attempt privilege escalation before trying new services
-  3. Try: sudo -l, uname -a for kernel exploits, find / -perm -4000 2>/dev/null for SUID binaries
-  4. If privesc succeeds, treat as root shell above
-  5. If privesc fails after 3 attempts, continue to next service
+  1. Attempt privilege escalation before trying new services
+  2. Try: sudo -l, uname -a for kernel exploits, find / -perm -4000 2>/dev/null for SUID binaries
+  3. If privesc succeeds, treat as root shell above
+  4. If privesc fails after 3 attempts, continue to next service
 
 IF NO SHELL YET:
   1. Continue to next service ranked by CVSS
   2. Do not retry a module that already failed
-  3. If all services attempted with no shell, write findings for each confirmed vulnerability and call complete()
+  3. If all services attempted with no shell, call complete()
 
 NEVER:
-  - Call complete() without writing at least one finding
   - Retry a module already in tried_module memory
   - Scan again if you already have port data in memory
   - Recall CVE IDs from your own knowledge -- copy them verbatim from lookup_cves results
 
-Finding format: each finding must have host, port (optional), title, severity (critical/high/medium/low/info), evidence.
+The runtime records findings and credentials automatically from your tool
+results, so you do not need to author them. Focus on enumeration and exploitation.
 
 TOOL USE RULES
 - Only call tools that exist in the AVAILABLE TOOLS list below -- do not invent tool names

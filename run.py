@@ -19,6 +19,7 @@ Usage:
 
 import atexit
 import json
+import signal
 import socket
 import subprocess
 import sys
@@ -168,6 +169,12 @@ def main() -> None:
     check_only = "--check" in sys.argv
     # --check is side-effect-free, so it never starts msfrpcd.
     start_msf = "--no-msfrpcd" not in sys.argv and not check_only
+
+    # atexit (which stops msfrpcd) runs on normal exit and on Ctrl+C, but NOT on
+    # SIGTERM, which terminates the interpreter without unwinding. A programmatic
+    # restart or `kill <pid>` would then orphan the msfrpcd we started. Translate
+    # SIGTERM into a normal exit so the atexit cleanup fires.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     preflight(start_msf=start_msf)
     if check_only:
