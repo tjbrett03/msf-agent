@@ -1,5 +1,6 @@
 venv/
 db/agent.db
+db/*.db.bak.*
 __pycache__/
 *.pyc
 *.pyo

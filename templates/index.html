@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MSF-Agent Monitor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <h1>MSF-Agent Monitor</h1>
+    <div class="controls">
+      <input id="target" type="text" placeholder="target ip (in scope)" autocomplete="off">
+      <button id="start-btn">Start New Engagement</button>
+      <button id="end-btn" class="secondary">End Engagement</button>
+      <span id="conn" class="conn conn-down">disconnected</span>
+    </div>
+  </header>
+
+  <!-- Shown only while viewing a past engagement (read-only snapshot). -->
+  <div id="viewbar" class="viewbar hidden"></div>
+
+  <main class="grid">
+    <!-- Module status: current run plus recent modules -->
+    <section class="panel" id="modules-panel">
+      <h2>Modules</h2>
+      <div class="current-module" id="current-module">
+        <span class="muted">no module running</span>
+      </div>
+      <ul class="recent-modules" id="recent-modules"></ul>
+    </section>
+
+    <!-- Engagement / run history keyed by UUID -->
+    <section class="panel" id="engagements-panel">
+      <h2>Engagements</h2>
+      <ul class="engagements" id="engagements"></ul>
+    </section>
+
+    <!-- Findings table -->
+    <section class="panel wide" id="findings-panel">
+      <h2>Findings</h2>
+      <table class="findings">
+        <thead>
+          <tr><th>Severity</th><th>Detail</th><th>Time</th><th>Engagement</th></tr>
+        </thead>
+        <tbody id="findings-body"></tbody>
+      </table>
+    </section>
+
+    <!-- Live raw event feed -->
+    <section class="panel wide" id="feed-panel">
+      <h2>Event Feed</h2>
+      <div class="feed" id="feed"></div>
+    </section>
+  </main>
+
+  <!-- Finding detail modal: opened by clicking a row in the Findings table. -->
+  <div id="finding-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span id="fm-severity" class="sev"></span>
+        <span id="fm-title"></span>
+        <button id="fm-close" class="secondary">close</button>
+      </div>
+      <div class="modal-meta" id="fm-meta"></div>
+      <pre class="modal-evidence" id="fm-evidence"></pre>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

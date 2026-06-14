@@ -15,6 +15,16 @@ AUTHORIZED_SCOPE = [
 # Ollama
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+# Per-request timeout (seconds) for the model call. A runaway generation would
+# otherwise wedge the whole engagement with no way to interrupt it (the abort
+# flag is only checked between iterations, not inside a blocking chat call).
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+# Max messages kept in the in-context history. SQLite is the durable memory and
+# the supervisor directive re-injects current state each turn, so old history is
+# redundant; pruning keeps the context (and the KV cache / VRAM) bounded instead
+# of growing every iteration until inference crawls. Always retains the system
+# prompt plus the most recent (CONTEXT_MAX_MESSAGES - 1) messages.
+CONTEXT_MAX_MESSAGES = int(os.getenv("CONTEXT_MAX_MESSAGES", "16"))
 
 # Metasploit RPC
 MSF_HOST = os.getenv("MSF_HOST", "127.0.0.1")

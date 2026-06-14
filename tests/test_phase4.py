@@ -539,11 +539,16 @@ class TestSessionAutoWrite(unittest.TestCase):
             "status": "ok", "session_opened": True,
             "session_id": "whoami1", "host_ip": target, "port": 21, "module": module,
         }
-        # id returns no uid=0; whoami returns root
-        mock_cmd.side_effect = [
-            {"status": "ok", "output": ""},
-            {"status": "ok", "output": "root\n"},
-        ]
+        # id returns no uid=0; whoami returns root. A root shell now also triggers
+        # the enumeration sweep, so answer by command rather than a fixed list
+        # (a 2-item side_effect would be exhausted by the enum commands).
+        def cmd_side(_sid, command, *a, **k):
+            if command == "id":
+                return {"status": "ok", "output": ""}
+            if command == "whoami":
+                return {"status": "ok", "output": "root\n"}
+            return {"status": "ok", "output": ""}  # enum commands, no output
+        mock_cmd.side_effect = cmd_side
         mock_chat.side_effect = [
             self._make_tc("run_module", {"host_ip": target, "port": 21, "module": module}),
             self._make_tc("complete", {"summary": "done"}),
@@ -554,6 +559,56 @@ class TestSessionAutoWrite(unittest.TestCase):
         rows = memory.query("session", {"host_ip": target}).get("rows", [])
         root_rows = [r for r in rows if r.get("msf_id") == "whoami1" and r.get("username") == "root"]
         self.assertTrue(len(root_rows) >= 1, msg=f"Expected root via whoami, got: {rows}")
+
+    @patch("time.sleep")
+    @patch("ollama.Client.chat")
+    @patch("tools.sessions.run_command")
+    @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
+    @patch("tools.exploit.run_module")
+    def test_root_shell_triggers_enumeration_and_parses_shadow(self, mock_run, _ls, mock_cmd, mock_chat, _sleep):
+        """A root shell auto-runs enumeration: command output becomes findings and
+        /etc/shadow hashes are parsed into the credential table."""
+        target = config.AUTHORIZED_SCOPE[0]
+        module = "exploit/unix/ftp/enum_unique"
+
+        memory.write("host", {"ip": target})
+        memory.write("port", [{"host_ip": target, "port": 21, "service": "ftp", "version": "vsftpd 2.3.4"}])
+
+        mock_run.return_value = {
+            "status": "ok", "session_opened": True,
+            "session_id": "enum1", "host_ip": target, "port": 21, "module": module,
+        }
+
+        shadow = "root:$6$abc$realhash:19000:0:99999:7:::\ndaemon:*:18000::::::\nmsfadmin:$1$old$md5hash:14685:0:99999:7:::"
+        def cmd_side(_sid, command, *a, **k):
+            if command == "id":
+                return {"status": "ok", "output": "uid=0(root) gid=0(root)"}
+            if command == "cat /etc/shadow":
+                return {"status": "ok", "output": shadow}
+            if command == "uname -a":
+                return {"status": "ok", "output": "Linux metasploitable 2.6.24"}
+            return {"status": "ok", "output": ""}
+        mock_cmd.side_effect = cmd_side
+        mock_chat.side_effect = [
+            self._make_tc("run_module", {"host_ip": target, "port": 21, "module": module}),
+            self._make_tc("complete", {"summary": "done"}),
+        ]
+
+        orchestrator.run(target)
+
+        # Only real hashes persist; the '*' locked account is skipped.
+        creds = memory.query("credential", {"host_ip": target}).get("rows", [])
+        users = {c["username"]: c["hash"] for c in creds}
+        self.assertIn("root", users)
+        self.assertIn("msfadmin", users)
+        self.assertNotIn("daemon", users)
+        self.assertEqual(users["root"], "$6$abc$realhash")
+
+        # Enumeration output landed as findings (kernel line at least).
+        findings = memory.query("finding", {"host_ip": target}).get("rows", [])
+        titles = [f["title"] for f in findings]
+        self.assertTrue(any("uname -a" in t for t in titles), msg=f"got: {titles}")
+        self.assertTrue(any("/etc/shadow" in t for t in titles), msg=f"got: {titles}")
 
     @patch("time.sleep")
     @patch("ollama.Client.chat")
@@ -929,6 +984,129 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         self.assertIn("user shell", result)
         self.assertIn("sudo -l", result)
         self.assertNotIn("full sudo", result)
+
+
+class TestContextPruning(unittest.TestCase):
+    """Context history is pruned to a bounded window so inference does not slow
+    and wedge as the message list grows. SQLite + the supervisor directive carry
+    the durable state, so dropping old turns is safe."""
+
+    def test_short_history_unchanged(self):
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+        self.assertEqual(orchestrator._prune_messages(msgs, 16), msgs)
+
+    def test_keeps_system_and_most_recent(self):
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(40):
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+            msgs.append({"role": "user", "content": f"u{i}"})
+        pruned = orchestrator._prune_messages(msgs, 16)
+        self.assertLessEqual(len(pruned), 16)
+        self.assertEqual(pruned[0]["content"], "sys")   # system prompt retained
+        self.assertEqual(pruned[-1], msgs[-1])           # newest message retained
+
+    def test_no_orphaned_tool_result_at_window_start(self):
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(20):
+            msgs.append({"role": "assistant", "content": "call", "tool_calls": [{}]})
+            msgs.append({"role": "tool", "content": f"t{i}"})
+        pruned = orchestrator._prune_messages(msgs, 6)
+        self.assertEqual(pruned[0]["content"], "sys")
+        # a 'tool' result must not be the first message after the system prompt
+        self.assertNotEqual(pruned[1]["role"], "tool")
+
+
+class TestEngagementPersistence(unittest.TestCase):
+    """A run is a first-class engagement: a row is created at start and finalized
+    at the end, findings are scoped to it, events are persisted for replay, and
+    findings survive the per-run table clear so past runs stay reviewable."""
+
+    def _make_tc(self, name, arguments):
+        tc = MagicMock()
+        tc.function.name = name
+        tc.function.arguments = arguments
+        msg = MagicMock()
+        msg.tool_calls = [tc]
+        msg.content = ""
+        resp = MagicMock()
+        resp.message = msg
+        return resp
+
+    @patch("time.sleep")
+    @patch("ollama.Client.chat")
+    @patch("tools.sessions.run_command")
+    @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
+    @patch("tools.exploit.run_module")
+    def test_engagement_row_findings_and_events_persist(self, mock_run, _ls, mock_cmd, mock_chat, _sleep):
+        target = config.AUTHORIZED_SCOPE[0]
+        eid = "persist-test-eng"
+        module = "exploit/unix/ftp/persist_unique"
+
+        memory.write("host", {"ip": target})
+        memory.write("port", [{"host_ip": target, "port": 21, "service": "ftp"}])
+        mock_run.return_value = {
+            "status": "ok", "session_opened": True,
+            "session_id": "ps1", "host_ip": target, "port": 21, "module": module,
+        }
+        def cmd_side(_sid, command, *a, **k):
+            if command == "id":
+                return {"status": "ok", "output": "uid=0(root)"}
+            return {"status": "ok", "output": ""}
+        mock_cmd.side_effect = cmd_side
+        mock_chat.side_effect = [
+            self._make_tc("run_module", {"host_ip": target, "port": 21, "module": module}),
+            self._make_tc("complete", {"summary": "done"}),
+        ]
+
+        orchestrator.run(target, eid)
+
+        conn = memory.get_connection()
+        try:
+            row = conn.execute("SELECT status, ended_at FROM engagement WHERE id = ?", (eid,)).fetchone()
+            self.assertIsNotNone(row, "engagement row should exist")
+            self.assertEqual(row["status"], "complete")
+            self.assertIsNotNone(row["ended_at"])
+            fcount = conn.execute("SELECT COUNT(*) FROM finding WHERE engagement_id = ?", (eid,)).fetchone()[0]
+            self.assertGreaterEqual(fcount, 1, "findings should be scoped to the engagement")
+            ecount = conn.execute("SELECT COUNT(*) FROM event WHERE engagement_id = ?", (eid,)).fetchone()[0]
+            self.assertGreater(ecount, 0, "events should be persisted for replay")
+        finally:
+            conn.close()
+
+    def test_clear_engagement_tables_keeps_findings(self):
+        target = config.AUTHORIZED_SCOPE[0]
+        memory.write("finding", {"host_ip": target, "title": "keep me", "severity": "info", "engagement_id": "keep"})
+        orchestrator._clear_engagement_tables(target)
+        rows = memory.read("finding", target).get("rows", [])
+        self.assertTrue(any(r["title"] == "keep me" for r in rows),
+                        msg="findings must survive the per-run table clear")
+
+
+class TestFindingsRuntimeOnly(unittest.TestCase):
+    """The model cannot author findings: memory_write('finding') is blocked so it
+    cannot fabricate loot the real data contradicts. Findings come only from the
+    runtime (module results, session detection, enumeration)."""
+
+    def test_model_memory_write_finding_is_blocked(self):
+        target = config.AUTHORIZED_SCOPE[0]
+        before = len(memory.read("finding", target).get("rows", []))
+        res = orchestrator._model_memory_write({
+            "category": "finding",
+            "data": {"host_ip": target, "title": "hallucinated", "severity": "critical", "evidence": "made up"},
+        })
+        self.assertEqual(res["status"], "ok")  # graceful, so the model does not retry-loop
+        after = len(memory.read("finding", target).get("rows", []))
+        self.assertEqual(before, after, "a model-authored finding must not be persisted")
+
+    def test_other_categories_still_write(self):
+        target = config.AUTHORIZED_SCOPE[0]
+        res = orchestrator._model_memory_write({
+            "category": "tried_module",
+            "data": {"host_ip": target, "port": 21, "module": "m/unique_rt", "result": "ok"},
+        })
+        self.assertEqual(res["status"], "ok")
+        rows = memory.query("tried_module", {"host_ip": target, "module": "m/unique_rt"}).get("rows", [])
+        self.assertEqual(len(rows), 1)
 
 
 if __name__ == "__main__":
