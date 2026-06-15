@@ -61,9 +61,26 @@ Phase 1: Complete. Phase 2: Complete. Phase 3: Complete. Phase 4 is current
 (hardening and tuning).
 
 ## Phase 4 progress (resume here)
-STATUS (2026-06-14): PR #1 (feature/engagement-suite) is MERGED into master
-(merge commit 96bd8f0). Work since then is committed directly on master. 110
-tests pass.
+STATUS (end of 2026-06-14 session): PR #1 (engagement-suite) MERGED into master
+(96bd8f0). Two loose-end fixes on master (c57c872). Phase A + session reliability
+DONE, LIVE-VERIFIED, committed on branch `feature/full-suite-pentester` (commit
+9c92986, one ahead of master, NOT pushed). 117 tests pass.
+
+RESUME HERE NEXT SESSION:
+- Branch `feature/full-suite-pentester` is checked out; working tree clean.
+- NEXT TASK = implement Phase B (full-suite pentester). The foundation plan is
+  written and APPROVED by the user: ~/.claude/plans/lay-down-the-foundation-
+  curried-moore.md (read it first -- it has the exact files/functions to change).
+- "Done" definition the user chose (module-level): record each module outcome
+  (tried_module already does), loop again, skip what is tried (guard already does),
+  and keep going until no service is 'untried' AND the model has no new module to
+  propose. Close a root session after it auto-documents so the loop continues.
+- Open thread: user said "use remote control" (RemoteTrigger / claude.ai routine)
+  right before stopping -- likely wanted to drive/schedule the Phase B run
+  remotely. Clarify intent before setting up any routine (it is outward-facing).
+- Daemons (msfrpcd, dashboard) were torn down at end of session; restart per the
+  "How to restart the runtime" section below. The agent.db has prior engagements
+  including the verified clean run 840f8236 (root + 7 creds + complete).
 
 IMMEDIATE LOOSE ENDS: BOTH DONE (2026-06-14, commit c57c872).
 1. DONE. prompts.py no longer tells the model to author findings/credentials
@@ -71,7 +88,7 @@ IMMEDIATE LOOSE ENDS: BOTH DONE (2026-06-14, commit c57c872).
 2. DONE. run.py installs a SIGTERM handler that sys.exit(0) so atexit tears down
    msfrpcd on `kill`/programmatic restart, not just Ctrl+C.
 
-### Phase A: memory/context hardening (DONE 2026-06-14, automated-verified; live-run pending)
+### Phase A: memory/context hardening (DONE + LIVE-VERIFIED 2026-06-14)
 Prereq for Phase B: durable per-service progress that survives context pruning,
 plus stop wasting context on duplicate CVE lookups.
 - Schema: new `service_state(host_ip, port, service, status, outcome, reason,
