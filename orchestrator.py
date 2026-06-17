@@ -337,7 +337,7 @@ def _clear_engagement_tables(target: str) -> None:
     try:
         # finding is intentionally excluded: findings are engagement-scoped now
         # and must persist across runs so prior engagements stay reviewable.
-        for table in ("port", "tried_module", "credential", "session", "service_state"):
+        for table in ("port", "tried_module", "credential", "session", "service_state", "service_assessment"):
             conn.execute(f"DELETE FROM {table} WHERE host_ip = ?", (target,))
         conn.execute("DELETE FROM host WHERE ip = ?", (target,))
         conn.commit()
@@ -988,6 +988,58 @@ def run(target: str, engagement_id: str | None = None) -> dict:
                         "evidence": (f"{svc} {p.get('version', '')}").strip() or "open",
                     }
                     _record_finding(finding, emit, engagement_id)
+
+                # Documentation axis: assess every open port for known CVEs at
+                # scan time, in the runtime, so documentation is exhaustive and
+                # complete before the model could ever finish. This is fact-
+                # gathering (record truth), not a decision: a port is assessed
+                # whether or not it is later exploited. The lookup goes through
+                # _dispatch so it shares the per-run CVE cache (a redundant model
+                # lookup will not re-hit NVD). One port's failure must not abort
+                # the rest, so each port is assessed in its own try/except.
+                for p in open_ports:
+                    port_no = p.get("port")
+                    service = p.get("service")
+                    try:
+                        if not service:
+                            # No service banner means nothing to look up, but the
+                            # row is still written so every open port is documented.
+                            vulnerable, severity, cve_ids = 0, None, None
+                        else:
+                            cve = _dispatch("lookup_cves", {
+                                "service": service,
+                                "version": p.get("version") or "",
+                            })
+                            cves = cve.get("cves", []) if cve.get("status") == "ok" else []
+                            if cves:
+                                # cves is sorted by cvss_score descending, so the
+                                # first entry is the most severe.
+                                vulnerable = 1
+                                severity   = cves[0].get("severity")
+                                cve_ids     = ",".join(
+                                    c.get("cve_id", "") for c in cves[:10]
+                                )
+                            else:
+                                # Lookup succeeded with no CVEs, or errored: either
+                                # way we have no vuln evidence. A transient NVD
+                                # error must not abort documenting the rest.
+                                vulnerable, severity, cve_ids = 0, None, None
+
+                        memory.write("service_assessment", {
+                            "host_ip":    target,
+                            "port":       port_no,
+                            "vulnerable": vulnerable,
+                            "severity":   severity,
+                            "cve_ids":    cve_ids,
+                        })
+                        emit("log", {"message": (
+                            f"assessed {service or 'unknown'} on port {port_no}: "
+                            f"vulnerable={vulnerable} severity={severity}"
+                        )})
+                    except Exception as e:
+                        emit("log", {"message": (
+                            f"assessment of port {port_no} failed: {e}"
+                        )})
                 ports_reported = True
 
             emit("log", {"message": f"iter {iteration} result: {_truncate_result(result)[:200]}"})
