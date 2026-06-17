@@ -69,13 +69,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "memory_read",
-            "description": "Read records from the agent's operational memory. Pass key (an IP address) to fetch all records for that host. Pass filters to narrow results by any column. Use this to check tried_module before attempting an exploit: memory_read('tried_module', '1.2.3.4', {'module': 'exploit/...'}).",
+            "description": "Read records from the agent's operational memory. Pass key (an IP address) to fetch all records for that host. Pass filters to narrow results by any column. Use this to check tried_module before attempting an exploit: memory_read('tried_module', '1.2.3.4', {'module': 'exploit/...'}). Use service_assessment to read the runtime's automatic per-port CVE/severity verdicts when ranking what to exploit.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
-                        "description": "One of: host, port, tried_module, credential, finding, session",
+                        "description": "One of: host, port, tried_module, credential, finding, session, service_state, service_assessment",
                     },
                     "key": {
                         "type": "string",
