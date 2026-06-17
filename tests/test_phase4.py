@@ -549,9 +549,9 @@ class TestSessionAutoWrite(unittest.TestCase):
             "status": "ok", "session_opened": True,
             "session_id": "whoami1", "host_ip": target, "port": 21, "module": module,
         }
-        # id returns no uid=0; whoami returns root. A root shell now also triggers
-        # the enumeration sweep, so answer by command rather than a fixed list
-        # (a 2-item side_effect would be exhausted by the enum commands).
+        # id returns no uid=0; whoami returns root. The runtime no longer sweeps
+        # the host on a root shell (enumeration is model-driven now), so answer by
+        # command to stay robust to whatever commands the runtime probes with.
         def cmd_side(_sid, command, *a, **k):
             if command == "id":
                 return {"status": "ok", "output": ""}
@@ -576,9 +576,10 @@ class TestSessionAutoWrite(unittest.TestCase):
     @patch("tools.sessions.run_command")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
     @patch("tools.exploit.run_module")
-    def test_root_shell_triggers_enumeration_and_parses_shadow(self, mock_run, _ls, mock_cmd, mock_chat, _sleep, _warm):
-        """A root shell auto-runs enumeration: command output becomes findings and
-        /etc/shadow hashes are parsed into the credential table."""
+    def test_model_dumps_shadow_loot_floor_captures_credentials(self, mock_run, _ls, mock_cmd, mock_chat, _sleep, _warm):
+        """Enumeration is model-driven now: the model opens a root shell, then
+        itself runs 'cat /etc/shadow', and the runtime loot floor captures the
+        hashes into the credential table (the runtime no longer auto-sweeps)."""
         target = config.AUTHORIZED_SCOPE[0]
         module = "exploit/unix/ftp/enum_unique"
 
@@ -596,30 +597,25 @@ class TestSessionAutoWrite(unittest.TestCase):
                 return {"status": "ok", "output": "uid=0(root) gid=0(root)"}
             if command == "cat /etc/shadow":
                 return {"status": "ok", "output": shadow}
-            if command == "uname -a":
-                return {"status": "ok", "output": "Linux metasploitable 2.6.24"}
             return {"status": "ok", "output": ""}
         mock_cmd.side_effect = cmd_side
+        # The model itself dumps /etc/shadow; the loot floor on run_command output
+        # is what persists the hashes, not any runtime enumeration sweep.
         mock_chat.side_effect = [
             self._make_tc("run_module", {"host_ip": target, "port": 21, "module": module}),
+            self._make_tc("run_command", {"session_id": "enum1", "command": "cat /etc/shadow"}),
             self._make_tc("complete", {"summary": "done"}),
         ]
 
         orchestrator.run(target)
 
-        # Only real hashes persist; the '*' locked account is skipped.
+        # Only real hashes persist; the '*' locked daemon account is skipped.
         creds = memory.query("credential", {"host_ip": target}).get("rows", [])
         users = {c["username"]: c["hash"] for c in creds}
         self.assertIn("root", users)
         self.assertIn("msfadmin", users)
         self.assertNotIn("daemon", users)
         self.assertEqual(users["root"], "$6$abc$realhash")
-
-        # Enumeration output landed as findings (kernel line at least).
-        findings = memory.query("finding", {"host_ip": target}).get("rows", [])
-        titles = [f["title"] for f in findings]
-        self.assertTrue(any("uname -a" in t for t in titles), msg=f"got: {titles}")
-        self.assertTrue(any("/etc/shadow" in t for t in titles), msg=f"got: {titles}")
 
     @patch("tools.sessions.warm_up", return_value={"status": "ok", "ready": True})
     @patch("time.sleep")
@@ -1293,6 +1289,45 @@ class TestSessionReliability(unittest.TestCase):
         cmd = sessions._split_token_echo(token)
         self.assertNotIn(token, cmd)          # not in the typed command line
         self.assertEqual(cmd.replace("''", "").split()[-1], token)  # but prints it
+
+
+class TestEnumerateSession(unittest.TestCase):
+    """The demoted `enumerate` scaffolding tool: a fixed battery of commands run
+    via run_command, returning combined labeled output. Unknown category errors."""
+
+    @patch("tools.sessions.run_command")
+    def test_system_category_combines_outputs(self, mock_cmd):
+        def cmd_side(_sid, command, *a, **k):
+            return {"status": "ok", "output": f"out:{command}"}
+        mock_cmd.side_effect = cmd_side
+
+        res = sessions.enumerate_session("7", "system")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["category"], "system")
+        # Each command's output is present in the combined section blob.
+        self.assertIn("out:uname -a", res["output"])
+        self.assertIn("out:cat /etc/issue", res["output"])
+        self.assertIn("out:hostname", res["output"])
+
+    @patch("tools.sessions.run_command")
+    def test_network_falls_back_when_primary_empty(self, mock_cmd):
+        def cmd_side(_sid, command, *a, **k):
+            # ip/ss yield nothing on Metasploitable; the fallbacks do.
+            if command in ("ip addr", "ss -tlnp"):
+                return {"status": "ok", "output": ""}
+            return {"status": "ok", "output": f"out:{command}"}
+        mock_cmd.side_effect = cmd_side
+
+        res = sessions.enumerate_session("7", "network")
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("out:ifconfig -a", res["output"])
+        self.assertIn("out:netstat -tlnp", res["output"])
+
+    @patch("tools.sessions.run_command")
+    def test_unknown_category_returns_error(self, mock_cmd):
+        res = sessions.enumerate_session("7", "bogus")
+        self.assertEqual(res["status"], "error")
+        mock_cmd.assert_not_called()
 
 
 if __name__ == "__main__":

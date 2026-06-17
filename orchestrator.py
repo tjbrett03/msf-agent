@@ -158,6 +158,21 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "enumerate",
+            "description": "Convenience fallback that runs a fixed battery of enumeration commands in a session and returns their combined output. You should NORMALLY decide what to look at and issue your own run_command calls (that is where the real reasoning happens); use enumerate only when you want a quick scaffolded sweep. It does NOT read /etc/shadow -- dump that with an explicit run_command if you want it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Session ID from list_sessions"},
+                    "category":   {"type": "string", "description": "Which battery to run: one of system, users, network, processes, privileges, or all (default all)."},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "complete",
             "description": "End the engagement. Call this when you have exhausted reasonable options or achieved your objectives.",
             "parameters": {
@@ -188,6 +203,7 @@ TOOL_MAP = {
     ),
     "list_sessions": lambda args: sessions.list_sessions(),
     "run_command":   lambda args: sessions.run_command(args["session_id"], args["command"]),
+    "enumerate":     lambda args: sessions.enumerate_session(args["session_id"], args.get("category", "all")),
     "complete":      lambda args: {"status": "complete", **args},
 }
 
@@ -681,61 +697,6 @@ def _capture_loot(output: str, target: str, emit, engagement_id: str | None = No
     return {"status": "ok", "credentials": cred_count, "findings": finding_count}
 
 
-# Enumeration sweep for a fresh root shell. Each step is
-# (title, primary command, fallback command) -- fallbacks cover hosts where the
-# primary tool is missing (Metasploitable 2 has ifconfig/netstat, not ip/ss).
-_ROOT_ENUM_STEPS = [
-    ("System: kernel (uname -a)",       "uname -a",       None),
-    ("System: OS release (/etc/issue)", "cat /etc/issue", None),
-    ("System: hostname",                "hostname",       None),
-    ("Users (/etc/passwd)",             "cat /etc/passwd", None),
-    ("Network: interfaces",             "ip addr",        "ifconfig -a"),
-    ("Network: listening sockets",      "netstat -tlnp",  "ss -tlnp"),
-    ("Processes (ps aux)",              "ps aux",         None),
-    ("Privileges (sudo -n -l)",         "sudo -n -l",     None),
-]
-
-
-def _run_enum_cmd(sid: str, primary: str, fallback: str | None) -> str:
-    """Run an enumeration command, falling back when the primary yields nothing."""
-    out = (sessions.run_command(sid, primary).get("output") or "").strip()
-    if not out and fallback:
-        out = (sessions.run_command(sid, fallback).get("output") or "").strip()
-    return out
-
-
-def _enumerate_root(sid: str, target: str, emit, engagement_id: str | None = None) -> None:
-    """Sweep a root shell and persist the loot.
-
-    Done in the runtime, not delegated to the model. Each command output is
-    stored as an info finding; /etc/shadow is captured as a finding and also
-    parsed into the credential table (the model historically dumped it but never
-    saved it, leaving the credential table empty).
-    """
-    for title, primary, fallback in _ROOT_ENUM_STEPS:
-        out = _run_enum_cmd(sid, primary, fallback)
-        if not out:
-            continue
-        _record_finding({
-            "host_ip":  target,
-            "port":     None,
-            "title":    f"Enumeration -- {title}",
-            "severity": "info",
-            "evidence": out[:2000],
-        }, emit, engagement_id)
-
-    shadow = _run_enum_cmd(sid, "cat /etc/shadow", None)
-    if shadow:
-        _record_finding({
-            "host_ip":  target,
-            "port":     None,
-            "title":    "Credentials -- /etc/shadow",
-            "severity": "high",
-            "evidence": shadow[:2000],
-        }, emit, engagement_id)
-        _persist_shadow_credentials(shadow, target, emit)
-
-
 def _persist_shadow_credentials(shadow: str, target: str, emit) -> None:
     """Parse /etc/shadow lines into the credential table, skipping locked accounts."""
     count = 0
@@ -936,10 +897,12 @@ def run(target: str, engagement_id: str | None = None) -> dict:
             result = _dispatch(tool_name, tool_args)
             print(f"[iter {iteration}] tool result: {result}")
 
-            # Loot capture floor: scan every successful run_command output for
-            # credentials and secrets in the runtime, so loot is recorded no matter
-            # where the model chose to look or whether it acts on what it found.
-            if tool_name == "run_command" and result.get("status") == "ok":
+            # Loot capture floor: scan every successful run_command or enumerate
+            # output for credentials and secrets in the runtime, so loot is recorded
+            # no matter where the model chose to look or whether it acts on what it
+            # found. enumerate_session returns its combined battery output in
+            # result["output"], so the floor catches anything that sweep surfaced.
+            if tool_name in ("run_command", "enumerate") and result.get("status") == "ok":
                 _capture_loot(result.get("output", ""), target, emit, engagement_id)
 
             if tool_name == "run_module":
@@ -1131,15 +1094,12 @@ def run(target: str, engagement_id: str | None = None) -> dict:
                         "evidence": (id_result.get("output") or "").strip()[:500] or f"session {sid} opened",
                     }, emit, engagement_id)
 
-                    # On a root shell, sweep the host in the runtime rather than
-                    # trusting the model to do post-exploitation. Persists each
-                    # command output as a finding and the /etc/shadow hashes as loot.
-                    if username == "root":
-                        _enumerate_root(sid, target, emit, engagement_id)
-
-                    # Shell opened AND its breach finding (plus root enumeration) is
-                    # recorded, so this service is fully written up. 'documented' is
-                    # the terminal state Phase B reads to decide the run is complete.
+                    # Shell opened AND its breach finding is recorded, so this
+                    # service is written up. Post-exploitation enumeration is now
+                    # model-driven (the model issues its own run_command calls and
+                    # the loot floor captures anything in the output); the runtime
+                    # no longer sweeps the host here. 'documented' is the terminal
+                    # state Phase B reads to decide the run is complete.
                     if shell_port is not None:
                         memory.advance_service_state(
                             target, shell_port, "documented", engagement_id=engagement_id,

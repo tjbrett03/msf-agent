@@ -203,6 +203,72 @@ def run_command(session_id: str | int, command: str, timeout: int = 30) -> dict:
     )
 
 
+# Enumeration batteries, keyed by category. Each entry is (label, primary,
+# fallback) -- the fallback covers hosts where the primary tool is missing
+# (Metasploitable 2 has ifconfig/netstat, not ip/ss). This is demoted scaffolding:
+# the model should normally pick its own commands; this is a quick fixed sweep.
+# /etc/shadow is intentionally NOT here -- reading it stays an explicit model
+# run_command choice (the orchestrator's loot floor captures it either way).
+_ENUM_BATTERIES = {
+    "system": [
+        ("kernel (uname -a)",       "uname -a",       None),
+        ("OS release (/etc/issue)", "cat /etc/issue", None),
+        ("hostname",                "hostname",       None),
+    ],
+    "users": [
+        ("users (/etc/passwd)", "cat /etc/passwd", None),
+    ],
+    "network": [
+        ("interfaces",        "ip addr",       "ifconfig -a"),
+        ("listening sockets", "netstat -tlnp", "ss -tlnp"),
+    ],
+    "processes": [
+        ("processes (ps aux)", "ps aux", None),
+    ],
+    "privileges": [
+        ("privileges (sudo -n -l)", "sudo -n -l", None),
+    ],
+}
+
+
+def enumerate_session(session_id: str | int, category: str = "all") -> dict:
+    """Run a fixed battery of enumeration commands and return combined output.
+
+    Demoted scaffolding / a fallback floor: the model normally reasons about
+    where loot hides and issues its own run_command calls. This just runs a
+    convenient sweep when asked. Each command goes through run_command (which is
+    serialized and hard-bounded), falling back to a secondary command when the
+    primary yields nothing. An unknown category is a structured error; a bad or
+    closed session surfaces as whatever run_command returns. Never raises.
+    """
+    category = (category or "all").strip().lower()
+    if category == "all":
+        steps = [s for cat in ("system", "users", "network", "processes", "privileges")
+                 for s in _ENUM_BATTERIES[cat]]
+    elif category in _ENUM_BATTERIES:
+        steps = list(_ENUM_BATTERIES[category])
+    else:
+        return {
+            "status": "error",
+            "error":  f"unknown enumeration category: {category} -- allowed: {sorted(_ENUM_BATTERIES) + ['all']}",
+        }
+
+    sections = []
+    for label, primary, fallback in steps:
+        res = run_command(session_id, primary)
+        out = (res.get("output") or "").strip()
+        if not out and fallback:
+            res = run_command(session_id, fallback)
+            out = (res.get("output") or "").strip()
+        sections.append(f"=== {label} ===\n{out}")
+
+    return {
+        "status":   "ok",
+        "category": category,
+        "output":   "\n\n".join(sections),
+    }
+
+
 def close_session(session_id: str | int) -> dict:
     """Stop an active session."""
     try:
