@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import time
 import uuid
@@ -590,6 +591,96 @@ def _record_finding(finding: dict, emit, engagement_id: str | None = None) -> No
     emit("finding", finding)
 
 
+# Loot patterns for _capture_loot. Compiled once at module load.
+# A /etc/shadow-style line: a username, a $id$...$ crypt hash, then a colon. We
+# match these specifically (not any colon-bearing line) because feeding ordinary
+# command output to the credential parser would write bogus rows for lines like
+# "Tasks: 5". A structured shadow line is the only run_command output treated as
+# ground-truth credential loot.
+_SHADOW_LINE_RE = re.compile(r"^[^:]+:\$[0-9a-z]+\$[^:]+:", re.MULTILINE)
+# A PEM private key block. Non-greedy body so multiple blocks in one output each
+# match rather than collapsing into one giant span. DOTALL so the body spans lines.
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+# AWS access key id.
+_AWS_KEY_RE = re.compile(r"AKIA[0-9A-Z]{16}")
+# Conservative inline-credential patterns: a URI with embedded user:password, and
+# a password=... style assignment. Kept tight on purpose; loose patterns turn
+# ordinary output into noise, and these go to the reviewable findings feed anyway.
+_CONN_STRING_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:@/]+:[^\s:@/]+@[^\s/]+")
+_PASSWORD_ASSIGN_RE = re.compile(r"(?i)\bpassword\s*[=:]\s*\S+")
+
+
+def _capture_loot(output: str, target: str, emit, engagement_id: str | None = None) -> dict:
+    """Scan command output for loot and persist it, no matter what the model did.
+
+    The model decides where to look; this floor guarantees the catch is recorded.
+    Shadow hashes are ground truth and go to the credential table; everything else
+    (private keys, cloud keys, inline creds) is a regex guess, so it goes to the
+    reviewable findings feed rather than the table the engagement acts on. Never
+    raises: a loot-capture failure must not crash the loop.
+    """
+    if not output:
+        return {"status": "ok", "credentials": 0, "findings": 0}
+
+    cred_count = 0
+    finding_count = 0
+    try:
+        # Shadow hashes: feed ONLY the matching lines to the existing parser, never
+        # the whole output (it splits every line on ':' and would invent rows for
+        # ordinary text like "Tasks: 5").
+        matched = [ln for ln in output.splitlines() if _SHADOW_LINE_RE.match(ln)]
+        if matched:
+            _persist_shadow_credentials("\n".join(matched), target, emit)
+            cred_count = len(matched)
+
+        for block in _PRIVATE_KEY_RE.findall(output):
+            _record_finding({
+                "host_ip":  target,
+                "port":     None,
+                "title":    "Loot -- private key exposed in command output",
+                "severity": "high",
+                "evidence": block[:2000],
+            }, emit, engagement_id)
+            finding_count += 1
+
+        for key in _AWS_KEY_RE.findall(output):
+            _record_finding({
+                "host_ip":  target,
+                "port":     None,
+                "title":    "Loot -- AWS access key exposed in command output",
+                "severity": "high",
+                "evidence": key,
+            }, emit, engagement_id)
+            finding_count += 1
+
+        for match in _CONN_STRING_RE.findall(output):
+            _record_finding({
+                "host_ip":  target,
+                "port":     None,
+                "title":    "Loot -- inline credentials in connection string",
+                "severity": "medium",
+                "evidence": match[:500],
+            }, emit, engagement_id)
+            finding_count += 1
+
+        for match in _PASSWORD_ASSIGN_RE.findall(output):
+            _record_finding({
+                "host_ip":  target,
+                "port":     None,
+                "title":    "Loot -- inline password assignment",
+                "severity": "medium",
+                "evidence": match[:500],
+            }, emit, engagement_id)
+            finding_count += 1
+    except Exception as e:
+        emit("log", {"message": f"loot capture failed: {e}"})
+
+    return {"status": "ok", "credentials": cred_count, "findings": finding_count}
+
+
 # Enumeration sweep for a fresh root shell. Each step is
 # (title, primary command, fallback command) -- fallbacks cover hosts where the
 # primary tool is missing (Metasploitable 2 has ifconfig/netstat, not ip/ss).
@@ -844,6 +935,12 @@ def run(target: str, engagement_id: str | None = None) -> dict:
 
             result = _dispatch(tool_name, tool_args)
             print(f"[iter {iteration}] tool result: {result}")
+
+            # Loot capture floor: scan every successful run_command output for
+            # credentials and secrets in the runtime, so loot is recorded no matter
+            # where the model chose to look or whether it acts on what it found.
+            if tool_name == "run_command" and result.get("status") == "ok":
+                _capture_loot(result.get("output", ""), target, emit, engagement_id)
 
             if tool_name == "run_module":
                 emit("module_finished", {
