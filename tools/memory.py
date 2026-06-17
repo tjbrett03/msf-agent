@@ -460,3 +460,25 @@ def query(category: str, filters: dict | None = None) -> dict:
         return {"status": "error", "error": str(e)}
     finally:
         conn.close()
+
+
+def set_credential_password(host_ip: str, hash: str, password: str) -> dict:
+    """Write a cracked plaintext back onto an existing credential row.
+
+    Keys on hash (the precise ground-truth value) plus host_ip rather than
+    username, because two accounts can share a username while their crypt
+    strings are unique. The row already exists as runtime-sourced truth; this
+    only fills its previously-empty password field.
+    """
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE credential SET password = ? WHERE host_ip = ? AND hash = ?",
+            (password, host_ip, hash),
+        )
+        conn.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()

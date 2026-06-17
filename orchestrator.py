@@ -9,6 +9,7 @@ import ollama
 
 import config
 import prompts
+import tools.cracking as cracking
 import tools.exploit as exploit
 import tools.intel as intel
 import tools.memory as memory
@@ -173,6 +174,20 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "crack_hashes",
+            "description": "Run John the Ripper against password hashes already looted into the credential table for this host (e.g. from /etc/shadow). Call this AFTER you have looted hashes. The runtime runs the cracker and writes back ONLY the real recovered plaintext onto the matching credential rows; a hash that does not crack stays without a password. Returns the cracked username/password pairs and how many uncracked hashes were attempted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host_ip": {"type": "string", "description": "Target host IP whose looted hashes should be cracked"},
+                },
+                "required": ["host_ip"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "complete",
             "description": "End the engagement. Call this when you have exhausted reasonable options or achieved your objectives.",
             "parameters": {
@@ -204,6 +219,7 @@ TOOL_MAP = {
     "list_sessions": lambda args: sessions.list_sessions(),
     "run_command":   lambda args: sessions.run_command(args["session_id"], args["command"]),
     "enumerate":     lambda args: sessions.enumerate_session(args["session_id"], args.get("category", "all")),
+    "crack_hashes":  lambda args: cracking.crack_hashes(args["host_ip"]),
     "complete":      lambda args: {"status": "complete", **args},
 }
 
