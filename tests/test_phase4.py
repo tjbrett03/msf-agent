@@ -1097,20 +1097,21 @@ class TestEngagementPersistence(unittest.TestCase):
 
 
 class TestFindingsRuntimeOnly(unittest.TestCase):
-    """The model cannot author findings: memory_write('finding') is blocked so it
-    cannot fabricate loot the real data contradicts. Findings come only from the
-    runtime (module results, session detection, enumeration)."""
+    """Trust split: the model may author findings (as its own unconfirmed CLAIMS,
+    stamped source='model'/confirmed=0), but credentials it cannot hand-write.
+    Confirmed FACTS come only from the runtime. See tests/test_trust_split.py for
+    the provenance-stamping assertions."""
 
-    def test_model_memory_write_finding_is_blocked(self):
+    def test_model_memory_write_credential_is_blocked(self):
         target = config.AUTHORIZED_SCOPE[0]
-        before = len(memory.read("finding", target).get("rows", []))
+        before = len(memory.read("credential", target).get("rows", []))
         res = orchestrator._model_memory_write({
-            "category": "finding",
-            "data": {"host_ip": target, "title": "hallucinated", "severity": "critical", "evidence": "made up"},
+            "category": "credential",
+            "data": {"host_ip": target, "username": "root", "password": "made up"},
         })
         self.assertEqual(res["status"], "ok")  # graceful, so the model does not retry-loop
-        after = len(memory.read("finding", target).get("rows", []))
-        self.assertEqual(before, after, "a model-authored finding must not be persisted")
+        after = len(memory.read("credential", target).get("rows", []))
+        self.assertEqual(before, after, "a model-authored credential must not be persisted")
 
     def test_other_categories_still_write(self):
         target = config.AUTHORIZED_SCOPE[0]

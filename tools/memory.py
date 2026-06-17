@@ -30,6 +30,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if cols and "engagement_id" not in cols:
         conn.execute("ALTER TABLE finding ADD COLUMN engagement_id TEXT")
         conn.commit()
+    # Trust-split columns: pre-existing DBs predate source/confirmed. Same guard
+    # as engagement_id above (PRAGMA shows the table exists; only ALTER if absent).
+    if cols and "source" not in cols:
+        conn.execute("ALTER TABLE finding ADD COLUMN source TEXT")
+        conn.commit()
+    if cols and "confirmed" not in cols:
+        conn.execute("ALTER TABLE finding ADD COLUMN confirmed INTEGER DEFAULT 0")
+        conn.commit()
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
@@ -66,6 +74,7 @@ def read(category: str, key: str, filters: dict | None = None) -> dict:
             "finding":      ("finding",      "host_ip"),
             "session":      ("session",      "host_ip"),
             "service_state":("service_state","host_ip"),
+            "service_assessment": ("service_assessment", "host_ip"),
         }
 
         if category not in table_key_map:
@@ -177,8 +186,10 @@ def write(category: str, data: dict | list) -> dict:
         elif category == "finding":
             conn.execute(
                 """
-                INSERT INTO finding (host_ip, port, title, severity, evidence, engagement_id)
-                VALUES (:host_ip, :port, :title, :severity, :evidence, :engagement_id)
+                INSERT INTO finding
+                    (host_ip, port, title, severity, evidence, engagement_id, source, confirmed)
+                VALUES
+                    (:host_ip, :port, :title, :severity, :evidence, :engagement_id, :source, :confirmed)
                 """,
                 {
                     "host_ip":  data.get("host_ip"),
@@ -187,6 +198,8 @@ def write(category: str, data: dict | list) -> dict:
                     "severity": data.get("severity"),
                     "evidence": data.get("evidence"),
                     "engagement_id": data.get("engagement_id"),
+                    "source":   data.get("source"),
+                    "confirmed": data.get("confirmed", 0),
                 },
             )
 
@@ -233,6 +246,31 @@ def write(category: str, data: dict | list) -> dict:
                     "outcome":  data.get("outcome"),
                     "reason":   data.get("reason"),
                     "engagement_id": data.get("engagement_id"),
+                },
+            )
+
+        elif category == "service_assessment":
+            # One assessment verdict per (host_ip, port). UPSERT overwrites the
+            # prior verdict because a re-assessment of the same service supersedes
+            # it; assessed_at is refreshed to mark when the verdict was last set.
+            conn.execute(
+                """
+                INSERT INTO service_assessment
+                    (host_ip, port, vulnerable, severity, cve_ids)
+                VALUES
+                    (:host_ip, :port, :vulnerable, :severity, :cve_ids)
+                ON CONFLICT(host_ip, port) DO UPDATE SET
+                    vulnerable  = excluded.vulnerable,
+                    severity    = excluded.severity,
+                    cve_ids     = excluded.cve_ids,
+                    assessed_at = datetime('now')
+                """,
+                {
+                    "host_ip":    data.get("host_ip"),
+                    "port":       data.get("port"),
+                    "vulnerable": data.get("vulnerable"),
+                    "severity":   data.get("severity"),
+                    "cve_ids":    data.get("cve_ids"),
                 },
             )
 
@@ -398,6 +436,7 @@ def query(category: str, filters: dict | None = None) -> dict:
             "finding":      "finding",
             "session":      "session",
             "service_state":"service_state",
+            "service_assessment": "service_assessment",
         }
 
         if category not in table_map:

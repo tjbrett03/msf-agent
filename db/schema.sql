@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS credential (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- The trust split: a finding records who authored it and whether the runtime
+-- confirmed it. source 'runtime' findings come from real tool results and are
+-- ground truth (confirmed = 1); source 'model' findings are the model's own
+-- observations/claims and stay unconfirmed (confirmed = 0) until the runtime
+-- verifies them. The model may surface claims here but may not pass them off as
+-- confirmed facts.
 CREATE TABLE IF NOT EXISTS finding (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     host_ip       TEXT NOT NULL,
@@ -48,7 +54,23 @@ CREATE TABLE IF NOT EXISTS finding (
     severity      TEXT NOT NULL,
     evidence      TEXT,
     engagement_id TEXT,
+    source        TEXT,
+    confirmed     INTEGER DEFAULT 0,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One verdict per service (host_ip, port): is it vulnerable, how bad, and which
+-- CVEs back that call. Distinct from service_state (which tracks exploitation
+-- progress); this is the assessment conclusion. cve_ids is a comma/JSON string.
+CREATE TABLE IF NOT EXISTS service_assessment (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_ip     TEXT NOT NULL,
+    port        INTEGER NOT NULL,
+    vulnerable  INTEGER,
+    severity    TEXT,
+    cve_ids     TEXT,
+    assessed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(host_ip, port)
 );
 
 CREATE TABLE IF NOT EXISTS session (
