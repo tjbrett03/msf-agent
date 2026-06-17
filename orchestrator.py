@@ -773,6 +773,53 @@ def _persist_shadow_credentials(shadow: str, target: str, emit) -> None:
         emit("log", {"message": f"persisted {count} credential hash(es) from /etc/shadow"})
 
 
+def _completion_blocked(target: str) -> dict | None:
+    """Fact-check floor on complete(): the model owns the decision, almost always.
+
+    The runtime refuses EXACTLY ONE case: a shell is open on the target AND no
+    loot was captured this engagement. That is the one outcome the model cannot
+    have meant -- it holds live access but recorded nothing actionable. Every
+    other completion is the model's call, including documenting vulns without ever
+    popping a shell (a legitimate result the user asked to allow).
+
+    Loot is credentials (the runtime captures real ones from results) OR a finding
+    titled "Loot -- ..." (the loot floor's secret catch). The auto open-port "info"
+    findings and the "Shell session as ..." breach finding are NOT loot, so keying
+    on credentials plus that title prefix excludes them correctly.
+
+    Returns a refusal result dict the model can act on, or None to allow. Never
+    raises: a query error is treated as "do not block" so a DB hiccup cannot trap
+    the engagement.
+    """
+    try:
+        sessions_result = memory.query("session", {"host_ip": target})
+        open_shell = any(
+            r.get("closed_at") is None for r in sessions_result.get("rows", [])
+        )
+        if not open_shell:
+            return None
+
+        creds = memory.query("credential", {"host_ip": target}).get("rows", [])
+        if creds:
+            return None
+
+        findings = memory.query("finding", {"host_ip": target}).get("rows", [])
+        if any((r.get("title") or "").startswith("Loot --") for r in findings):
+            return None
+    except Exception:
+        # A DB hiccup must not strand the model on complete(); allow it through.
+        return None
+
+    return {
+        "status": "error",
+        "error": (
+            f"Completion refused: you hold an open shell on {target} but have "
+            "captured no loot this engagement. Enumerate the host and pull "
+            "credentials or secrets (or record loot findings) before completing."
+        ),
+    }
+
+
 def run(target: str, engagement_id: str | None = None) -> dict:
     """
     Run the agentic loop against target until complete() is called or limits hit.
@@ -1052,6 +1099,16 @@ def run(target: str, engagement_id: str | None = None) -> dict:
                             f"assessment of port {port_no} failed: {e}"
                         )})
                 ports_reported = True
+
+            # Completion fact-check floor, BEFORE the tool-result append. If the
+            # floor refuses, swap the refusal in as `result` so the model sees the
+            # reason as its tool result and the loop continues; the complete() exit
+            # below is then naturally skipped (result is no longer "complete").
+            if result.get("status") == "complete":
+                blocked = _completion_blocked(target)
+                if blocked is not None:
+                    result = blocked
+                    emit("log", {"message": f"completion refused: open shell, no loot on {target}"})
 
             emit("log", {"message": f"iter {iteration} result: {_truncate_result(result)[:200]}"})
 
