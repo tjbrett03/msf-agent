@@ -31,6 +31,7 @@ tools/exploit.py  pymetasploit3
 tools/sessions.py session management
 tools/memory.py   SQLite operations
 tools/intel.py    NVD + SearchSploit
+tools/cracking.py John the Ripper handoff (crack_hashes), agentic-rebuild branch
 db/schema.sql     SQLite schema
 db/agent.db       SQLite database (gitignored)
 
@@ -57,10 +58,126 @@ number. Reconcile this checklist only at phase boundaries.
       templates/index.html, static/dashboard.{js,css}
 
 ## Current phase
-Phase 1: Complete. Phase 2: Complete. Phase 3: Complete. Phase 4 is current
-(hardening and tuning).
+Phase 1-3: Complete. Phase 4 (hardening/tuning) is where the AGENTIC REBUILD
+happened. Active work now lives on branch `agentic-rebuild` (see below); the
+older Phase 4 / Phase A+B notes further down are HISTORY of the pre-rebuild
+architecture and describe behavior the rebuild deliberately replaced.
 
-## Phase 4 progress (resume here)
+## Agentic rebuild (branch: agentic-rebuild) -- RESUME HERE
+The handoff at ~/Downloads/enumeration_handoff(1).md redefined the project: turn
+the hardcoded exploitation script with an LLM stapled on into a real autonomous
+agent. North star: THE RUNTIME DELIVERS STATE AND RECORDS TRUTH; THE MODEL
+DECIDES EVERY ACTION. A decision (which service, which module, escalate vs pivot,
+what to enumerate, when done) belongs to the model. A fact (shell opened, uid=0,
+this hash, this port open, this module fired) belongs to the runtime.
+
+BRANCHING (per the handoff's method, user-approved):
+- `v1-hardcoded` tag = the known-good reliable baseline (the old stop-at-root,
+  hardcoded-sweep version). It is the fallback demo and does NOT get deleted.
+- `agentic-rebuild` branch = all rebuild work. Cut from the baseline after the
+  pre-rebuild bug fixes were committed.
+- DO NOT merge agentic-rebuild to master until it demonstrates JUDGMENT on a
+  SECOND, UNSEEDED VM (a target it was not tuned for). Metasploitable 2 is only
+  the wiring check. The rule of thumb: if you catch yourself moving a DECISION
+  back into the runtime to make the Metasploitable run look cleaner, stop -- that
+  is the project failing, not the model. Fix it with prompt doctrine or tool
+  wording, or accept the variance. Hardcoding a decision is only correct on the
+  baseline.
+
+WHAT SHIPPED (steps 0-8, each a committed checkpoint on agentic-rebuild; run
+`git log v1-hardcoded..HEAD` for the per-step commits):
+1. Trust split + schema. finding gained source ('runtime'|'model') + confirmed
+   (0/1); new service_assessment table (host_ip, port, vulnerable, severity,
+   cve_ids). _model_memory_write now BLOCKS model credential writes (ok+note) and
+   ALLOWS model findings stamped source=model/confirmed=0; _record_finding stamps
+   runtime/confirmed=1. credential is runtime-only (so it needs no confirmed
+   column; every row is ground truth by construction).
+2. Loot floor. _capture_loot(output, target, emit, eid) runs on every successful
+   run_command AND enumerate result: shadow-hash lines -> credential table via
+   _persist_shadow_credentials (only lines matching ^[^:]+:$id$...: , never raw
+   output); private keys / AWS keys / inline creds -> runtime findings (reviewable
+   feed, not the credential table). Makes it safe to hand enumeration to the model.
+3. Documentation axis. After a scan, the runtime auto-assesses EVERY open port via
+   lookup_cves (through _dispatch so it shares the per-run CVE cache) and writes a
+   service_assessment row (vulnerable/severity/cve_ids). Documentation is
+   exhaustive and runtime-owned, complete before the model could ever finish.
+   service_assessment is cleared per run in _clear_engagement_tables.
+4. Removed the hardcoded root sweep (_enumerate_root, _ROOT_ENUM_STEPS,
+   _run_enum_cmd and the auto-call). Kept _persist_shadow_credentials and all
+   runtime shell/root detection (warm_up, id, uid=0, breach finding). Added a
+   DEMOTED enumerate(session_id, category) tool (sessions.enumerate_session) as a
+   convenience FALLBACK battery (system/users/network/processes/privileges/all),
+   not the primary path. Does not read /etc/shadow.
+5. Directives = state injection (the core change). build_supervisor_directive
+   rewritten from imperatives to facts: root-shell / user-shell state lines carry
+   loot counts + untried services; Rule 3's completion gate ("do not call
+   complete() until each port attempted") DELETED; scan-twice kept as a fact.
+   _sudo_l_status kept; it now feeds a state line. Helpers _untried_services
+   (severity-annotated) and _loot_counts re-inject durable state every turn.
+6. Model-ranked selective exploitation. prompts.py rewritten from rigid
+   WORKFLOW/IF-ROOT control flow to attacker doctrine: document all (automatic),
+   exploit selectively (rank candidates, pick the single best path to root), seek
+   root, escalate before pivoting, loot what you take, completion is the model's
+   call. memory_read schema now lists service_state/service_assessment so the
+   doctrine's "read the assessment" is actionable.
+7. Completion floor. Model decides complete(); the runtime refuses EXACTLY ONE
+   case via _completion_blocked(target): a shell is open AND zero loot captured
+   (no credential row and no "Loot --" finding). No documentation gate, no
+   attempt-every-port gate. A completion with documented-but-unexploited vulns and
+   no shell is valid.
+8. Hash cracking. tools/cracking.py crack_hashes(host_ip) feeds uncracked hashes
+   (hash present, password empty) to `john` via subprocess, then `john --show`,
+   and writes back ONLY real cracked plaintext via memory.set_credential_password
+   (keyed on host_ip+hash). Defensive like searchsploit (john-missing/timeout ->
+   structured error, never raises). No new pip packages; shells out to system john.
+
+LIVE WIRING-CHECK RESULT (2026-06-17, engagement 1df4811f vs Metasploitable 2):
+Full autonomous run, completed on the model's own call at iter 16. Worked: scan
+-> auto-assess all ports (21 CRITICAL, 513 HIGH, 80 MEDIUM, ...) -> model RANKED
+and chose vsftpd itself -> root shell -> model-driven enumeration (plus the
+enumerate fallback) -> loot floor captured shadow creds + secrets -> model
+decided completion -> floor allowed it. This is the architecture working, not a
+script. The directive feed read as state ("State: root shell ... Loot captured
+so far: N credentials, M findings. Decide what to pull."), exactly as designed.
+
+WHAT TO DO NEXT (in rough priority):
+A. FIX (real fact-recording bug): DUPLICATE CREDENTIALS. The model re-cat'd
+   /etc/shadow and the loot floor's _persist_shadow_credentials does a plain
+   INSERT with no uniqueness, so 7 real creds were recorded as 14. The runtime is
+   supposed to record TRUTH. Fix: add UNIQUE(host_ip, username, hash) on
+   credential (or upsert / dedup-on-write). This is the first thing to fix; it is
+   a runtime correctness defect, not model judgment.
+B. TIGHTEN loot noise (runtime, low risk): the _PASSWORD_ASSIGN_RE
+   (password\s*[=:]\s*\S+) fired ~18 times on config-file comments (php.ini etc.)
+   during `grep -r password`, flooding the findings feed. Tighten the pattern or
+   drop the bare password= heuristic; keep private-key/AWS/connection-string.
+C. PROMPT-DOCTRINE TUNING (NOT rails -- fix in prompts.py only): the model (a)
+   looped on enumerate(all) for ~8 iterations re-reading shadow instead of
+   progressing, (b) never called crack_hashes despite holding 7 hashes, and (c)
+   stopped after a single service with 513/HIGH and 80/MEDIUM still untried.
+   (a)/(b) are efficiency/closure gaps; (c) is defensible under "exploit
+   selectively / completion is your call" but shows the model defaulting to
+   minimal effort. Per the handoff: resist hardcoding any of these back into the
+   runtime. Nudge with doctrine wording (e.g. "after looting hashes, crack them";
+   "do not re-run the same sweep").
+D. THE REAL TEST (unproven): stand up a SECOND, UNSEEDED vulnerable VM and judge
+   the agent there. Metasploitable was only the wiring check. Do not merge to
+   master until judgment is demonstrated on the unseeded box.
+E. DEFERRED (do not build yet, per handoff): step 9 report/AAR stage (reads only
+   confirmed items; the engagement.aar column is the reserved hook), and the
+   RAG/vector memory boundary (search_knowledge + episodic RAG over confirmed
+   loot). SQLite owns "this, exactly"; Chroma, eventually, owns "like this".
+
+How to run the live test: VirtualBox VM powered on, then `python run.py`
+(preflights Ollama/msfrpcd/target, auto-starts msfrpcd in foreground, serves the
+dashboard at http://127.0.0.1:5000). Watch the SSE/event feed (or
+GET /engagement/<id>), NOT server stdout (still block-buffered, AAR gap #4).
+
+## Phase 4 progress (HISTORY -- pre-rebuild architecture, on master/baseline)
+NOTE: everything below predates the agentic rebuild above and describes the OLD
+behavior the rebuild replaced (stop-at-root Rule 1, hardcoded _enumerate_root
+sweep, model forbidden from authoring findings). Kept as project history; for
+current state read the "Agentic rebuild" section above.
 STATUS (end of 2026-06-14 session): PR #1 (engagement-suite) MERGED into master
 (96bd8f0). Two loose-end fixes on master (c57c872). Phase A + session reliability
 DONE, LIVE-VERIFIED, committed on branch `feature/full-suite-pentester` (commit
