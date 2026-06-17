@@ -214,12 +214,15 @@ class TestScanStuckDetection(unittest.TestCase):
         result = orchestrator.run(target)
         self.assertEqual(result["status"], "complete")
 
-        # The third call's message history should contain the stuck warning.
+        # The duplicate scan is blocked, not just warned about: the real scan
+        # only ran once and the steering is folded into a tool-role result (a
+        # user message would split the assistant tool_calls from its result).
+        self.assertEqual(mock_scan.call_count, 1)
         third_call_messages = mock_chat.call_args_list[2][1]["messages"]
-        user_msgs = [m for m in third_call_messages if m["role"] == "user"]
+        tool_msgs = [m for m in third_call_messages if m["role"] == "tool"]
         self.assertTrue(
-            any("already have port data" in m["content"] for m in user_msgs),
-            msg=f"No stuck warning found in user messages: {user_msgs}",
+            any("already have port data" in m["content"] for m in tool_msgs),
+            msg=f"No block notice found in tool messages: {tool_msgs}",
         )
 
     @patch("ollama.Client.chat")
@@ -365,9 +368,11 @@ class TestScanStuckNormalized(unittest.TestCase):
         result = orchestrator.run(target)
         self.assertEqual(result["status"], "complete")
 
+        # Same normalized key -> the second scan is blocked, not dispatched.
+        self.assertEqual(mock_scan.call_count, 1)
         third_messages = mock_chat.call_args_list[2][1]["messages"]
-        user_msgs = [m for m in third_messages if m["role"] == "user"]
-        self.assertTrue(any("already have port data" in m["content"] for m in user_msgs))
+        tool_msgs = [m for m in third_messages if m["role"] == "tool"]
+        self.assertTrue(any("already have port data" in m["content"] for m in tool_msgs))
 
     @patch("ollama.Client.chat")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})
@@ -385,9 +390,11 @@ class TestScanStuckNormalized(unittest.TestCase):
         result = orchestrator.run(target)
         self.assertEqual(result["status"], "complete")
 
+        # Rounds to the same normalized key -> the second scan is blocked.
+        self.assertEqual(mock_scan.call_count, 1)
         third_messages = mock_chat.call_args_list[2][1]["messages"]
-        user_msgs = [m for m in third_messages if m["role"] == "user"]
-        self.assertTrue(any("already have port data" in m["content"] for m in user_msgs))
+        tool_msgs = [m for m in third_messages if m["role"] == "tool"]
+        self.assertTrue(any("already have port data" in m["content"] for m in tool_msgs))
 
     @patch("ollama.Client.chat")
     @patch("tools.sessions.list_sessions", return_value={"status": "ok", "count": 0, "sessions": {}})

@@ -114,7 +114,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_module",
-            "description": "Run a Metasploit exploit or auxiliary module against a target. Always call memory_query('tried_module') first to confirm the module has not already been tried on this host and port.",
+            "description": "Run a Metasploit exploit or auxiliary module against a target. Always call memory_read('tried_module') first to confirm the module has not already been tried on this host and port.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -355,21 +355,45 @@ def _truncate_result(result: dict) -> str:
 
 def _sudo_l_status(messages: list[dict]) -> str:
     """
-    Scan the last 10 tool-role messages for evidence of a sudo -l result.
-    Returns 'full_sudo' if (ALL) ALL or (ALL : ALL) was found in output,
-    'partial' if sudo -l ran but no full-access entry was present,
-    or 'not_run' if sudo -l has not been called yet.
+    Determine whether `sudo -l` has been run this engagement and, if so, whether
+    it granted full sudo rights. Returns 'full_sudo' if (ALL) ALL or (ALL : ALL)
+    was found in the output, 'partial' if sudo -l ran but no full-access entry
+    was present, or 'not_run' if sudo -l has not been called yet.
+
+    The fact that sudo -l ran is detected from the assistant tool_calls
+    arguments (the call site), not the tool result: a tool-role message holds
+    the command's OUTPUT, while what was actually invoked lives on the preceding
+    assistant message's tool_calls. (sessions.run_command does happen to echo the
+    command back into its result dict, but its exception path drops it, so the
+    call site is the only reliable record that the command was issued.) The
+    tool result is still consulted, but only to read the output that classifies
+    full_sudo vs partial.
     """
-    for m in reversed(messages[-10:]):
-        if m.get("role") != "tool":
-            continue
-        content = m.get("content", "")
-        if '"command": "sudo -l"' not in content:
-            continue
-        if "(ALL) ALL" in content or "(ALL : ALL)" in content:
-            return "full_sudo"
-        return "partial"
-    return "not_run"
+    ran = False
+    for m in reversed(messages[-12:]):
+        role = m.get("role")
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                if fn.get("name") != "run_command":
+                    continue
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                cmd = (args.get("command") or "").strip()
+                if cmd == "sudo -l" or cmd.startswith("sudo -l "):
+                    ran = True
+        elif role == "tool":
+            content = m.get("content", "")
+            if "sudo -l" not in content:
+                continue
+            if "(ALL) ALL" in content or "(ALL : ALL)" in content:
+                return "full_sudo"
+            ran = True
+    return "partial" if ran else "not_run"
 
 
 def build_supervisor_directive(target: str, messages: list[dict]) -> str:
@@ -378,55 +402,52 @@ def build_supervisor_directive(target: str, messages: list[dict]) -> str:
     steering directive injected before every Ollama call. Rules are
     checked in strict priority order; the first match wins.
     """
-    # Rule 1: a root shell is open -- nothing else matters.
+    # Rules 1 and 2 both key off open sessions, so query once and share the list.
     session_result = memory.query("session", {"host_ip": target})
-    if session_result.get("status") == "ok":
-        open_sessions = [
-            r for r in session_result.get("rows", [])
-            if r.get("closed_at") is None
-        ]
-        for row in open_sessions:
-            is_root = (
-                row.get("username") == "root"
-                or "root" in (row.get("session_type") or "").lower()
+    open_sessions = (
+        [r for r in session_result.get("rows", []) if r.get("closed_at") is None]
+        if session_result.get("status") == "ok"
+        else []
+    )
+
+    # Rule 1: a root shell is open -- nothing else matters.
+    for row in open_sessions:
+        is_root = (
+            row.get("username") == "root"
+            or "root" in (row.get("session_type") or "").lower()
+        )
+        if is_root:
+            msf_id = row.get("msf_id", "?")
+            return (
+                f"STOP EXPLOITING. You have a root shell on {target} "
+                f"(session {msf_id}). Run post-exploitation commands now: "
+                "whoami, id, uname -a, cat /etc/passwd, cat /etc/shadow. "
+                "Findings are recorded automatically; call complete() when done."
             )
-            if is_root:
-                msf_id = row.get("msf_id", "?")
-                return (
-                    f"STOP EXPLOITING. You have a root shell on {target} "
-                    f"(session {msf_id}). Run post-exploitation commands now: "
-                    "whoami, id, uname -a, cat /etc/passwd, cat /etc/shadow. "
-                    "Findings are recorded automatically; call complete() when done."
-                )
 
     # Rule 2: a non-root shell is open -- escalate before trying new services.
     # The specific directive depends on how far along the escalation attempt is.
-    if session_result.get("status") == "ok":
-        open_sessions = [
-            r for r in session_result.get("rows", [])
-            if r.get("closed_at") is None
-        ]
-        if open_sessions:
-            msf_id = open_sessions[0].get("msf_id", "?")
-            sudo_status = _sudo_l_status(messages)
-            if sudo_status == "full_sudo":
-                return (
-                    f"You already confirmed full sudo access on {target}. "
-                    f"Run 'sudo id' in session {msf_id} right now to confirm root. "
-                    "Then call complete()."
-                )
-            if sudo_status == "partial":
-                return (
-                    f"sudo -l ran but no full sudo rights found on {target} "
-                    f"(session {msf_id}). "
-                    "Check SUID binaries: find / -perm -4000 2>/dev/null "
-                    "or check kernel version for local exploits."
-                )
+    if open_sessions:
+        msf_id = open_sessions[0].get("msf_id", "?")
+        sudo_status = _sudo_l_status(messages)
+        if sudo_status == "full_sudo":
             return (
-                f"You have a user shell on {target} (session {msf_id}). "
-                "Attempt privilege escalation before trying new exploits. "
-                "Try sudo -l first."
+                f"You already confirmed full sudo access on {target}. "
+                f"Run 'sudo id' in session {msf_id} right now to confirm root. "
+                "Then call complete()."
             )
+        if sudo_status == "partial":
+            return (
+                f"sudo -l ran but no full sudo rights found on {target} "
+                f"(session {msf_id}). "
+                "Check SUID binaries: find / -perm -4000 2>/dev/null "
+                "or check kernel version for local exploits."
+            )
+        return (
+            f"You have a user shell on {target} (session {msf_id}). "
+            "Attempt privilege escalation before trying new exploits. "
+            "Try sudo -l first."
+        )
 
     # Rule 3: a discovered service still has no exploit attempt. Sourced from
     # service_state, the durable progress table: the runtime seeds an 'untried'
@@ -663,10 +684,14 @@ def run(target: str, engagement_id: str | None = None) -> dict:
         _abort_requested.pop(engagement_id, None)
         return result
 
+    # Emit started before the scope check so the reject path below still produces
+    # a balanced started/finished pair (finish emits engagement_finished); a lone
+    # engagement_finished with no preceding start confuses the dashboard.
+    emit("engagement_started", {"target": target})
+
     if target not in config.AUTHORIZED_SCOPE:
         return finish({"status": "error", "error": f"{target} is not in authorized scope"})
 
-    emit("engagement_started", {"target": target})
     _clear_sessions()
     _clear_engagement_tables(target)
     # Fresh CVE lookup cache per run. Only one engagement runs at a time (the
@@ -757,16 +782,18 @@ def run(target: str, engagement_id: str | None = None) -> dict:
                 prior_count = scan_counts.get(scan_target, 0)
 
                 if prior_count >= 2:
-                    # Hard block: target has been scanned twice already.
-                    block_msg = (
-                        f"You have already scanned {target} twice in this engagement. "
-                        "Do NOT scan again. Call memory_read('port', '"
-                        f"{target}') to access the stored port data and move to exploitation."
-                    )
-                    messages.append({"role": "user", "content": block_msg})
+                    # Hard block: target has been scanned twice already. The
+                    # steering is folded into the tool result rather than emitted
+                    # as a separate user message, which would otherwise land
+                    # between the assistant tool_calls and this tool result and
+                    # malform the chat template.
                     result = {
                         "status": "error",
-                        "error":  f"scan blocked: {scan_target} scanned {prior_count} times -- use memory_read to access port data",
+                        "error":  (
+                            f"scan blocked: {scan_target} scanned {prior_count} times. "
+                            f"Do NOT scan again. Call memory_read('port', '{target}') to "
+                            "access the stored port data and move to exploitation."
+                        ),
                     }
                     print(f"[iter {iteration}] scan blocked ({prior_count} prior scans for {scan_target})")
                     messages.append({"role": "tool", "content": _truncate_result(result)})
@@ -774,13 +801,21 @@ def run(target: str, engagement_id: str | None = None) -> dict:
 
                 scan_key = _normalize_scan_key(tool_args)
                 if scan_key == last_scan_key:
-                    messages.append({
-                        "role":    "user",
-                        "content": (
-                            f"You already have port data for {target} from the previous scan. "
-                            "Do not scan again. Use the data you already have and move to the next step."
+                    # Identical re-scan: block it instead of just warning, so the
+                    # scan does not actually run. Steering is folded into the tool
+                    # result (see the hard-block note above) rather than emitted as
+                    # a separate user message.
+                    result = {
+                        "status": "error",
+                        "error":  (
+                            f"scan blocked: you already have port data for {target} from "
+                            "the previous scan. Do not scan again. Use the data you have and "
+                            "move to the next step."
                         ),
-                    })
+                    }
+                    print(f"[iter {iteration}] duplicate scan blocked ({scan_target})")
+                    messages.append({"role": "tool", "content": _truncate_result(result)})
+                    continue
                 last_scan_key = scan_key
                 scan_counts[scan_target] = prior_count + 1
 
