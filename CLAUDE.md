@@ -140,6 +140,27 @@ decided completion -> floor allowed it. This is the architecture working, not a
 script. The directive feed read as state ("State: root shell ... Loot captured
 so far: N credentials, M findings. Decide what to pull."), exactly as designed.
 
+KNOWN LIMITATIONS (state of this branch as pushed; do NOT treat as merge-ready):
+- NOT validated on an unseeded target. Only the Metasploitable 2 wiring check has
+  run. The axis that matters (judgment on a host it was not tuned for) is UNPROVEN.
+  Do not merge to master on the strength of the Metasploitable run.
+- Duplicate-credential fact bug (open): re-reading /etc/shadow double-writes the
+  credential table (7 real creds recorded as 14); no uniqueness on credential
+  INSERT yet. See next-step A. The runtime over-counts loot until this is fixed.
+- Loot-finding noise (open): the bare `password=` heuristic floods the findings
+  feed with false positives from config comments. See next-step B.
+- Model behavior is variance-prone by design: in the wiring run it looped on
+  enumerate(all), never called crack_hashes despite holding hashes, and stopped
+  after one service with others untried. These are model-judgment/efficiency gaps
+  to address with prompt doctrine (next-step C), NOT runtime rails. Expect the
+  agent to sometimes look "dumber" than v1-hardcoded on Metasploitable; that is
+  the design (real judgment made visible), see the handoff's honest caveat.
+- Deferred / not built: report/AAR stage (step 9) and the RAG/vector memory layer.
+- Operational gap (pre-rebuild, still open): orchestrator stdout is block-buffered
+  (AAR gap #4); watch the SSE/event feed or GET /engagement/<id>, not server stdout.
+- Hash cracking depends on a system `john` binary on PATH (ships with Metasploit);
+  absent it, crack_hashes returns a structured error rather than cracking.
+
 WHAT TO DO NEXT (in rough priority):
 A. FIX (real fact-recording bug): DUPLICATE CREDENTIALS. The model re-cat'd
    /etc/shadow and the loot floor's _persist_shadow_credentials does a plain
