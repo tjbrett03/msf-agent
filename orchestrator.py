@@ -422,11 +422,62 @@ def _sudo_l_status(messages: list[dict]) -> str:
     return "partial" if ran else "not_run"
 
 
+def _untried_services(target: str) -> list[str]:
+    """
+    Return the still-untried open ports as annotated strings, sorted by port.
+    Sourced from service_state (the durable progress table the runtime seeds
+    per open port on scan), so this fact survives context pruning even when the
+    model has forgotten what it scanned. Where service_assessment carries a
+    severity for a port, the string is annotated (e.g. "21 (critical)") so the
+    model can rank what is worth its time. The runtime states the facts; the
+    decision about which to pursue stays with the model.
+    """
+    svc_result = memory.query("service_state", {"host_ip": target})
+    if svc_result.get("status") != "ok":
+        return []
+    untried_ports = sorted(
+        r["port"] for r in svc_result.get("rows", []) if r.get("status") == "untried"
+    )
+    if not untried_ports:
+        return []
+
+    # Optional severity annotation from the vulnerability assessment table.
+    severity_by_port: dict = {}
+    assess_result = memory.query("service_assessment", {"host_ip": target})
+    if assess_result.get("status") == "ok":
+        for r in assess_result.get("rows", []):
+            sev = r.get("severity")
+            if sev:
+                severity_by_port[r.get("port")] = sev
+
+    annotated = []
+    for port in untried_ports:
+        sev = severity_by_port.get(port)
+        annotated.append(f"{port} ({sev})" if sev else str(port))
+    return annotated
+
+
+def _loot_counts(target: str) -> tuple[int, int]:
+    """
+    Return (credential count, finding count) for target from durable memory.
+    Re-injecting loot totals every turn is fact delivery that survives pruning,
+    so a pivot/continue decision has real numbers behind it.
+    """
+    cred_rows = memory.query("credential", {"host_ip": target}).get("rows", [])
+    finding_rows = memory.query("finding", {"host_ip": target}).get("rows", [])
+    return len(cred_rows), len(finding_rows)
+
+
 def build_supervisor_directive(target: str, messages: list[dict]) -> str:
     """
     Inspect DB state and recent message history to produce a concise
-    steering directive injected before every Ollama call. Rules are
+    situational-awareness directive injected before every Ollama call. Rules are
     checked in strict priority order; the first match wins.
+
+    North star: the runtime delivers STATE and records truth; the model decides
+    every action. Each rule states what is true and known (re-injected from
+    SQLite so it survives context pruning) and hands the move to the model. The
+    runtime does not issue orders here.
     """
     # Rules 1 and 2 both key off open sessions, so query once and share the list.
     session_result = memory.query("session", {"host_ip": target})
@@ -436,7 +487,8 @@ def build_supervisor_directive(target: str, messages: list[dict]) -> str:
         else []
     )
 
-    # Rule 1: a root shell is open -- nothing else matters.
+    # Rule 1: a root shell is open. State the foothold and loot; the model
+    # decides what to enumerate, loot, or whether to pivot.
     for row in open_sessions:
         is_root = (
             row.get("username") == "root"
@@ -444,51 +496,48 @@ def build_supervisor_directive(target: str, messages: list[dict]) -> str:
         )
         if is_root:
             msf_id = row.get("msf_id", "?")
+            creds, findings = _loot_counts(target)
+            untried = _untried_services(target)
+            untried_str = ", ".join(untried) if untried else "none"
             return (
-                f"STOP EXPLOITING. You have a root shell on {target} "
-                f"(session {msf_id}). Run post-exploitation commands now: "
-                "whoami, id, uname -a, cat /etc/passwd, cat /etc/shadow. "
-                "Findings are recorded automatically; call complete() when done."
+                f"State: root shell on {target} (session {msf_id}). "
+                f"Loot captured so far: {creds} credentials, {findings} findings. "
+                f"Untried services remaining: {untried_str}. "
+                "Decide what to enumerate, loot, or whether to pivot."
             )
 
-    # Rule 2: a non-root shell is open -- escalate before trying new services.
-    # The specific directive depends on how far along the escalation attempt is.
+    # Rule 2: a non-root shell is open. State the foothold, privesc progress
+    # (derived from _sudo_l_status), loot, and what else is available, then leave
+    # the escalate-or-pivot decision to the model.
     if open_sessions:
         msf_id = open_sessions[0].get("msf_id", "?")
         sudo_status = _sudo_l_status(messages)
         if sudo_status == "full_sudo":
-            return (
-                f"You already confirmed full sudo access on {target}. "
-                f"Run 'sudo id' in session {msf_id} right now to confirm root. "
-                "Then call complete()."
-            )
-        if sudo_status == "partial":
-            return (
-                f"sudo -l ran but no full sudo rights found on {target} "
-                f"(session {msf_id}). "
-                "Check SUID binaries: find / -perm -4000 2>/dev/null "
-                "or check kernel version for local exploits."
-            )
+            privesc = "sudo -l shows full sudo rights are available."
+        elif sudo_status == "partial":
+            privesc = "sudo -l ran and showed no full sudo rights."
+        else:
+            privesc = "sudo -l has not been run yet."
+        creds, findings = _loot_counts(target)
+        untried = _untried_services(target)
+        untried_str = ", ".join(untried) if untried else "none"
         return (
-            f"You have a user shell on {target} (session {msf_id}). "
-            "Attempt privilege escalation before trying new exploits. "
-            "Try sudo -l first."
+            f"State: user shell on {target} (session {msf_id}); root not yet "
+            f"achieved. Privesc status: {privesc} "
+            f"Loot captured so far: {creds} credentials, {findings} findings. "
+            f"Untried services remaining: {untried_str}. "
+            "Decide whether to escalate or pivot."
         )
 
-    # Rule 3: a discovered service still has no exploit attempt. Sourced from
-    # service_state, the durable progress table: the runtime seeds an 'untried'
-    # row per open port on scan and advances it as modules run, so this survives
-    # context pruning even when the model has forgotten what it scanned.
-    svc_result = memory.query("service_state", {"host_ip": target})
-    if svc_result.get("status") == "ok" and svc_result.get("rows"):
-        untried = sorted(
-            r["port"] for r in svc_result["rows"] if r.get("status") == "untried"
+    # Rule 3: no open session, but discovered services have not been attempted.
+    # State which (annotated with severity where known) so the model can rank
+    # them; whether they are worth its time is the model's call.
+    untried = _untried_services(target)
+    if untried:
+        return (
+            f"State: no open session on {target}. "
+            f"Vulnerable services not yet attempted: {', '.join(untried)}."
         )
-        if untried:
-            return (
-                f"Untried services on {target}: ports {untried}. "
-                "Do not call complete() until each has an attempt or a documented skip reason."
-            )
 
     # Rule 4: model has scanned the same target twice in the last 6 messages.
     scan_count = 0
@@ -509,9 +558,8 @@ def build_supervisor_directive(target: str, messages: list[dict]) -> str:
                 scan_count += 1
     if scan_count >= 2:
         return (
-            f"You have already scanned {target} twice. "
-            "Port data is in memory. Do not scan again. "
-            "Move to exploitation."
+            f"State: {target} has already been scanned twice. "
+            "Port data is in memory."
         )
 
     # Rule 5: no special condition.

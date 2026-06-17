@@ -802,7 +802,7 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         mock_read.return_value = {"status": "ok", "rows": []}
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
-        self.assertIn("STOP EXPLOITING", result)
+        self.assertNotIn("STOP EXPLOITING", result)
         self.assertIn("root shell", result)
         self.assertIn("session 1", result)
 
@@ -821,7 +821,8 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         mock_read.return_value = {"status": "ok", "rows": []}
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
-        self.assertIn("STOP EXPLOITING", result)
+        self.assertIn("root shell", result)
+        self.assertIn("session 2", result)
 
     @patch("tools.memory.query")
     @patch("tools.memory.read")
@@ -839,7 +840,7 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         mock_read.return_value = {"status": "ok", "rows": []}
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
-        self.assertNotIn("STOP EXPLOITING", result)
+        self.assertNotIn("root shell", result)
 
     # --- Rule 2 ---
 
@@ -859,7 +860,7 @@ class TestBuildSupervisorDirective(unittest.TestCase):
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
         self.assertIn("user shell", result)
-        self.assertIn("privilege escalation", result)
+        self.assertIn("root not yet achieved", result)
         self.assertIn("session 4", result)
 
     # --- Rule 3 ---
@@ -878,9 +879,9 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         mock_query.side_effect = qside
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
-        self.assertIn("Untried services", result)
+        self.assertIn("not yet attempted", result)
         self.assertIn("21", result)
-        self.assertIn("Do not call complete()", result)
+        self.assertNotIn("Do not call complete()", result)
 
     @patch("tools.memory.query")
     def test_rule3_skipped_when_all_ports_tried(self, mock_query):
@@ -892,7 +893,7 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         mock_query.side_effect = qside
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
-        self.assertNotIn("Untried services", result)
+        self.assertNotIn("not yet attempted", result)
 
     # --- Rule 4 ---
 
@@ -905,8 +906,8 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         messages = [self._scan_msg(self.TARGET), self._scan_msg(self.TARGET)]
 
         result = orchestrator.build_supervisor_directive(self.TARGET, messages)
-        self.assertIn("already scanned", result)
-        self.assertIn("Do not scan again", result)
+        self.assertIn("already been scanned twice", result)
+        self.assertNotIn("Move to exploitation", result)
 
     @patch("tools.memory.query")
     @patch("tools.memory.read")
@@ -917,7 +918,7 @@ class TestBuildSupervisorDirective(unittest.TestCase):
         messages = [self._scan_msg(self.TARGET)]
 
         result = orchestrator.build_supervisor_directive(self.TARGET, messages)
-        self.assertNotIn("already scanned", result)
+        self.assertNotIn("already been scanned twice", result)
 
     # --- Rule 5 ---
 
@@ -965,9 +966,9 @@ class TestBuildSupervisorDirective(unittest.TestCase):
                            "User root may run the following commands on this host:\n    (ALL) ALL\n")
         ]
         result = orchestrator.build_supervisor_directive(self.TARGET, messages)
-        self.assertIn("full sudo", result)
-        self.assertIn("sudo id", result)
-        self.assertIn("complete()", result)
+        self.assertIn("user shell", result)
+        self.assertIn("full sudo rights are available", result)
+        self.assertNotIn("sudo id", result)
 
     @patch("tools.memory.query")
     @patch("tools.memory.read")
@@ -980,8 +981,8 @@ class TestBuildSupervisorDirective(unittest.TestCase):
             self._tool_msg("sudo -l", "Sorry, user daemon may not run sudo on target.\n")
         ]
         result = orchestrator.build_supervisor_directive(self.TARGET, messages)
-        self.assertIn("SUID", result)
-        self.assertNotIn("already confirmed full sudo", result)
+        self.assertIn("no full sudo rights", result)
+        self.assertNotIn("SUID", result)
 
     @patch("tools.memory.query")
     @patch("tools.memory.read")
@@ -992,7 +993,7 @@ class TestBuildSupervisorDirective(unittest.TestCase):
 
         result = orchestrator.build_supervisor_directive(self.TARGET, [])
         self.assertIn("user shell", result)
-        self.assertIn("sudo -l", result)
+        self.assertIn("sudo -l has not been run yet", result)
         self.assertNotIn("full sudo", result)
 
 
@@ -1174,6 +1175,9 @@ class TestServiceState(unittest.TestCase):
         # other rules (session) take priority, so guard on the table being read.
         rows = memory.query("service_state", {"host_ip": target}).get("rows", [])
         self.assertTrue(any(r["port"] == 23 and r["status"] == "untried" for r in rows))
+        # When no session is open, the directive surfaces the untried port as state.
+        self.assertIn("not yet attempted", directive)
+        self.assertIn("23", directive)
 
 
 class TestCveLookupDedup(unittest.TestCase):
